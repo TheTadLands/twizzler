@@ -38,7 +38,7 @@ unsafe impl Send for TwizzlerTransport {}
 fn get_device() -> Option<Device> {
     let devices = devmgr::get_devices(devmgr::DriverSpec {
         supported: devmgr::Supported::PcieClass(2, 0, 0),
-    })?;
+    }).ok()?;
 
     for device in &devices {
         let device = Device::new(device.id).ok();
