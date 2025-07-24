@@ -75,6 +75,7 @@ initrd = [
 
     "crate:sec-test",
     "crate:ptest",
+    "crate:stdnet_test",
 
     #"third-party:hello-world-rs"
     #"crate:test-tiny-http",
