@@ -11,6 +11,7 @@ mod process;
 mod slot;
 mod thread;
 mod time;
+mod trace;
 pub(crate) mod upcall;
 
 use twizzler_abi::simple_mutex::Mutex;
@@ -40,6 +41,7 @@ impl std::fmt::Debug for ReferenceRuntime {
 
 bitflags::bitflags! {
     /// Various state flags for the runtime.
+    #[derive(Copy, Clone, Debug)]
     pub struct RuntimeState : u32 {
         const READY = 1;
         const IS_MONITOR = 2;
@@ -74,8 +76,10 @@ pub static OUR_RUNTIME: ReferenceRuntime = ReferenceRuntime {
 // Or, at least, that's what it seems like. In any case, they're no-ops in libunwind and musl, so
 // this is fine for now.
 #[no_mangle]
+#[linkage = "weak"]
 pub extern "C" fn __register_frame_info() {}
 #[no_mangle]
+#[linkage = "weak"]
 pub extern "C" fn __deregister_frame_info() {}
 #[no_mangle]
 #[linkage = "weak"]

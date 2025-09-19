@@ -20,6 +20,8 @@
 #![feature(linkage)]
 #![feature(test)]
 #![feature(c_variadic)]
+
+use syscall::KernelConsoleSource;
 pub mod arch;
 
 #[allow(unused_extern_crates)]
@@ -38,6 +40,7 @@ pub mod simple_mutex;
 pub mod slot;
 pub mod syscall;
 pub mod thread;
+pub mod trace;
 pub mod upcall;
 
 #[inline]
@@ -46,7 +49,11 @@ unsafe fn internal_abort() -> ! {
 }
 
 pub fn print_err(err: &str) {
-    syscall::sys_kernel_console_write(err.as_bytes(), syscall::KernelConsoleWriteFlags::empty());
+    syscall::sys_kernel_console_write(
+        KernelConsoleSource::Console,
+        err.as_bytes(),
+        syscall::KernelConsoleWriteFlags::empty(),
+    );
 }
 
 #[allow(dead_code)]
@@ -84,11 +91,80 @@ extern crate test;
 
 #[cfg(test)]
 mod tester {
+    use core::sync::atomic::AtomicU64;
+
+    use crate::{
+        simple_mutex::Mutex,
+        syscall::{
+            sys_thread_sync, ThreadSync, ThreadSyncFlags, ThreadSyncOp, ThreadSyncReference,
+            ThreadSyncSleep, ThreadSyncWake,
+        },
+    };
+
     #[bench]
     fn test_bench(bench: &mut test::Bencher) {
         bench.iter(|| {
             for i in 0..10000 {
                 core::hint::black_box(i);
+            }
+        });
+    }
+
+    #[bench]
+    fn bench_yield(bench: &mut test::Bencher) {
+        bench.iter(|| {
+            crate::syscall::sys_thread_yield();
+        });
+    }
+
+    #[bench]
+    fn bench_simple_syscall(bench: &mut test::Bencher) {
+        bench.iter(|| {
+            crate::syscall::sys_thread_self_id();
+        });
+    }
+
+    #[bench]
+    fn bench_thread_sync_sleep_ready(bench: &mut test::Bencher) {
+        let word = AtomicU64::new(0);
+        bench.iter(|| {
+            let r = sys_thread_sync(
+                &mut [ThreadSync::new_sleep(ThreadSyncSleep::new(
+                    ThreadSyncReference::Virtual(&word),
+                    1,
+                    ThreadSyncOp::Equal,
+                    ThreadSyncFlags::empty(),
+                ))],
+                None,
+            );
+            let _ = core::hint::black_box(r);
+        });
+    }
+
+    #[bench]
+    fn bench_thread_sync_wake(bench: &mut test::Bencher) {
+        let word = AtomicU64::new(0);
+        bench.iter(|| {
+            let r = sys_thread_sync(
+                &mut [ThreadSync::new_wake(ThreadSyncWake::new(
+                    ThreadSyncReference::Virtual(&word),
+                    1,
+                ))],
+                None,
+            );
+            let _ = core::hint::black_box(r);
+        });
+    }
+
+    #[bench]
+    fn bench1000_smutex_lock_unlock(bench: &mut test::Bencher) {
+        let lock = Mutex::new(3);
+        bench.iter(|| {
+            for _ in 0..1000 {
+                let mut g = lock.lock();
+                *g += 1;
+                let g = core::hint::black_box(g);
+                drop(g);
             }
         });
     }

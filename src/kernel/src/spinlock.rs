@@ -5,7 +5,10 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::processor::spin_wait_until;
+use crate::processor::{
+    sched::{schedule, SchedFlags},
+    spin_wait_until,
+};
 
 pub trait RelaxStrategy {
     fn relax(iters: usize);
@@ -16,7 +19,7 @@ impl RelaxStrategy for Reschedule {
     #[inline]
     fn relax(iters: usize) {
         if iters > 100 {
-            crate::sched::schedule(true);
+            schedule(SchedFlags::YIELD | SchedFlags::PREEMPT | SchedFlags::REINSERT);
         }
     }
 }
@@ -67,6 +70,14 @@ impl<T, Relax: RelaxStrategy> GenericSpinlock<T, Relax> {
             },
             || {
                 iters += 1;
+                if iters == 10000 {
+                    //emerglogln!("spinlock pause: {}", caller);
+                }
+                if iters == 100000 {
+                    emerglogln!("spinlock long pause: {}, locked at {:?}", caller, unsafe {
+                        self.locked_from.get().as_ref().unwrap()
+                    });
+                }
                 Relax::relax(iters);
             },
         );
@@ -75,6 +86,7 @@ impl<T, Relax: RelaxStrategy> GenericSpinlock<T, Relax> {
             lock: self,
             interrupt_state,
             dont_unlock_on_drop: false,
+            locker: core::panic::Location::caller(),
         }
     }
 
@@ -89,6 +101,7 @@ pub struct LockGuard<'a, T, Relax: RelaxStrategy> {
     lock: &'a GenericSpinlock<T, Relax>,
     interrupt_state: bool,
     dont_unlock_on_drop: bool,
+    pub locker: &'static core::panic::Location<'static>,
 }
 
 pub type SpinLockGuard<'a, T> = LockGuard<'a, T, SpinLoop>;

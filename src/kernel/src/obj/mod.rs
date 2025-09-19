@@ -1,19 +1,22 @@
 use alloc::{
+    boxed::Box,
     collections::{btree_map::Entry, btree_set::BTreeSet, BTreeMap},
     sync::{Arc, Weak},
     vec::Vec,
 };
 use core::{
     fmt::Display,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
+use bitset_core::BitSet;
 use pages::PageRef;
 use range::{GetPageFlags, PageStatus};
 use twizzler_abi::{
+    device::NUM_DEVICE_INTERRUPTS,
     meta::{MetaFlags, MetaInfo},
     object::{ObjID, Protections, MAX_SIZE},
-    syscall::{CreateTieSpec, LifetimeType},
+    syscall::{BackingType, CreateTieSpec, LifetimeType, ObjectInfo},
 };
 use twizzler_rt_abi::object::Nonce;
 
@@ -41,11 +44,13 @@ pub mod thread_sync;
 pub mod ties;
 
 const OBJ_DELETED: u32 = 1;
+pub const OBJ_HAS_INTERRUPTS: u32 = 2;
 pub struct Object {
     id: ObjID,
     flags: AtomicU32,
     range_tree: Mutex<range::PageRangeTree>,
     sleep_info: Mutex<SleepInfo>,
+    device_interrupt_info: Box<[(AtomicU64, AtomicU64); NUM_DEVICE_INTERRUPTS]>,
     pin_info: Mutex<PinInfo>,
     contexts: Mutex<ContextInfo>,
     lifetime_type: LifetimeType,
@@ -114,6 +119,14 @@ impl PageNumber {
         self.0 == 0
     }
 
+    pub fn is_meta(&self) -> bool {
+        self.as_byte_offset() == MAX_SIZE - Self::PAGE_SIZE
+    }
+
+    pub fn meta_page() -> Self {
+        Self((MAX_SIZE - Self::PAGE_SIZE) / Self::PAGE_SIZE)
+    }
+
     pub fn base_page() -> Self {
         Self(1)
     }
@@ -144,6 +157,14 @@ impl PageNumber {
 
     pub fn offset(&self, off: usize) -> Self {
         Self(self.0 + off)
+    }
+
+    pub fn byte_offset(&self, off: usize) -> Self {
+        Self(self.0 + off / Self::PAGE_SIZE)
+    }
+
+    pub fn align_down(&self, align: usize) -> Self {
+        Self(self.0 & !(align - 1))
     }
 }
 
@@ -202,7 +223,7 @@ impl Object {
                 v.push(p.physical_address());
             } else {
                 let frame = alloc_frame(FrameAllocFlags::ZEROED | FrameAllocFlags::WAIT_OK);
-                let page = Page::new(frame);
+                let page = Page::new(frame, 1);
                 v.push(page.physical_address());
                 let page = PageRef::new(Arc::new(page), 0, 1);
                 tree.add_page(start.offset(i), page, None);
@@ -220,14 +241,17 @@ impl Object {
         Self {
             id,
             flags: AtomicU32::new(0),
-            range_tree: Mutex::new(range::PageRangeTree::new()),
-            sleep_info: Mutex::new(SleepInfo::new()),
+            range_tree: Mutex::new(range::PageRangeTree::new(id)),
+            sleep_info: Mutex::new(SleepInfo::new(id)),
             pin_info: Mutex::new(PinInfo::default()),
             contexts: Mutex::new(ContextInfo::default()),
             ties: ties.to_vec(),
             verified_id: OnceWait::new(),
             lifetime_type,
             dirty_set: DirtySet::new(),
+            device_interrupt_info: Box::new(
+                [const { (AtomicU64::new(0), AtomicU64::new(0)) }; NUM_DEVICE_INTERRUPTS],
+            ),
         }
     }
 
@@ -294,11 +318,51 @@ impl Object {
     pub fn dirty_set(&self) -> &DirtySet {
         &self.dirty_set
     }
+
+    pub fn info(&self) -> ObjectInfo {
+        let num_pages = {
+            let page_tree = self.lock_page_tree();
+            let r = page_tree.range(0.into()..usize::MAX.into());
+            let mut page_count = 0;
+            for range in r {
+                page_count += range.1.length;
+            }
+            page_count
+        };
+        ObjectInfo {
+            id: self.id,
+            // TODO: see self.contexts?
+            maps: 0,
+            // TODO: see TIE_MGR
+            ties_to: 0,
+            ties_from: 0,
+            life: self.lifetime_type,
+            backing: BackingType::default(),
+            pages: num_pages,
+        }
+    }
 }
 
 impl Drop for Object {
     fn drop(&mut self) {
-        //logln!("Dropping object {}", self.id);
+        /*
+        let pt = self.lock_page_tree();
+        let range = pt.range(PageNumber::base_page()..PageNumber::meta_page().next());
+        let mut private_mem = 0;
+        let mut shared_mem = 0;
+        for r in range {
+            let pr = r.1.value();
+            let (p, s) = pr.estimate_memory_usage();
+            private_mem += p;
+            shared_mem += s;
+        }
+        logln!(
+            "Dropping object {} (p: {}MB, s: {}MB)",
+            self.id,
+            private_mem / (1024 * 1024),
+            shared_mem / (1024 * 1024)
+        );
+        */
     }
 }
 
@@ -458,30 +522,88 @@ pub fn no_exist(id: ObjID) {
 
 #[derive(Clone)]
 pub struct DirtySet {
-    set: Arc<Mutex<BTreeSet<PageNumber>>>,
+    set: Arc<Mutex<Vec<u8>>>,
 }
 
 impl DirtySet {
     pub fn new() -> Self {
         Self {
-            set: Arc::new(Mutex::new(BTreeSet::new())),
+            set: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn drain_all(&self) -> Vec<PageNumber> {
-        let dirty = self.set.lock().extract_if(|_| true).collect::<Vec<_>>();
-        dirty
+    pub fn drain_all(&self) -> Vec<(PageNumber, usize)> {
+        let mut set = self.set.lock();
+        let mut pages: Vec<(PageNumber, usize)> = Vec::new();
+        for b in 0..set.bit_len() {
+            if set.bit_test(b) {
+                if b > 0 && set.bit_test(b - 1) {
+                    pages.last_mut().unwrap().1 += 1;
+                } else {
+                    pages.push((PageNumber::from(b), 1));
+                }
+            }
+        }
+        set.fill(0);
+        pages
     }
 
     fn is_dirty(&self, pn: PageNumber) -> bool {
-        self.set.lock().contains(&pn)
+        let set = self.set.lock();
+        if pn.0 < set.bit_len() {
+            set.bit_test(pn.0)
+        } else {
+            false
+        }
     }
 
-    pub fn add_dirty(&self, pn: PageNumber) {
-        self.set.lock().insert(pn);
+    pub fn add_dirty(&self, pn: PageNumber, num: usize) {
+        let mut set = self.set.lock();
+        if pn.0 + num > set.bit_len() {
+            let add = ((pn.0 + num) - set.bit_len()) / 8 + 1;
+            set.extend((0..add).into_iter().map(|_| 0));
+        }
+        for i in 0..num {
+            set.bit_set(pn.0 + i);
+        }
     }
 
     fn reset_dirty(&self, pn: PageNumber) {
-        self.set.lock().remove(&pn);
+        let mut set = self.set.lock();
+        if pn.0 < set.bit_len() {
+            set.bit_reset(pn.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use twizzler_kernel_macros::kernel_test;
+
+    #[kernel_test]
+    fn test_page_number_align_down() {
+        use super::PageNumber;
+
+        // Test aligning down with power-of-2 alignments
+        assert_eq!(PageNumber(15).align_down(1), PageNumber(15));
+        assert_eq!(PageNumber(15).align_down(2), PageNumber(14));
+        assert_eq!(PageNumber(15).align_down(4), PageNumber(12));
+        assert_eq!(PageNumber(15).align_down(8), PageNumber(8));
+        assert_eq!(PageNumber(15).align_down(16), PageNumber(0));
+
+        // Test with already aligned values
+        assert_eq!(PageNumber(16).align_down(16), PageNumber(16));
+        assert_eq!(PageNumber(32).align_down(8), PageNumber(32));
+        assert_eq!(PageNumber(64).align_down(32), PageNumber(64));
+
+        // Test with zero
+        assert_eq!(PageNumber(0).align_down(1), PageNumber(0));
+        assert_eq!(PageNumber(0).align_down(4), PageNumber(0));
+        assert_eq!(PageNumber(0).align_down(16), PageNumber(0));
+
+        // Test edge cases
+        assert_eq!(PageNumber(1).align_down(2), PageNumber(0));
+        assert_eq!(PageNumber(7).align_down(8), PageNumber(0));
+        assert_eq!(PageNumber(255).align_down(256), PageNumber(0));
     }
 }

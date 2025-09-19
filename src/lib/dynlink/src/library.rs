@@ -3,13 +3,15 @@
 use std::fmt::{Debug, Display};
 
 use elf::{
-    abi::{DT_FLAGS_1, PT_PHDR, PT_TLS, STB_WEAK},
+    abi::{DT_FLAGS_1, PT_DYNAMIC, PT_PHDR, PT_TLS, STB_WEAK},
+    dynamic::Dyn,
     endian::NativeEndian,
     segment::{Elf64_Phdr, ProgramHeader},
     ParseError,
 };
 use petgraph::stable_graph::NodeIndex;
 use secgate::RawSecGateInfo;
+use smallstr::SmallString;
 use twizzler_rt_abi::{
     core::{CtorSet, RuntimeInfo},
     debug::LoadedImageId,
@@ -42,22 +44,22 @@ pub enum AllowedGates {
 
 #[repr(C)]
 /// An unloaded library. It's just a name, really.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Ord, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Ord, Eq, Hash, Default)]
 pub struct UnloadedLibrary {
     pub name: String,
 }
 
 impl UnloadedLibrary {
     /// Construct a new unloaded library.
-    pub fn new(name: impl ToString) -> Self {
+    pub fn new(name: impl AsRef<str>) -> Self {
         Self {
-            name: name.to_string(),
+            name: name.as_ref().to_string(),
         }
     }
 }
 
 /// The ID struct for a library.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash, Default)]
 #[repr(transparent)]
 pub struct LibraryId(pub(crate) NodeIndex);
 
@@ -143,6 +145,16 @@ impl Library {
         self.allowed_gates == AllowedGates::PublicInclSelf
     }
 
+    pub fn dynamic_ptr(&self) -> Option<*mut Dyn> {
+        let phdr = self
+            .get_elf()
+            .ok()?
+            .segments()?
+            .iter()
+            .find(|s| s.p_type == PT_DYNAMIC)?;
+        Some(self.laddr_mut(phdr.p_vaddr))
+    }
+
     pub fn is_binary(&self) -> bool {
         let Some(dynamic) = self
             .get_elf()
@@ -215,7 +227,7 @@ impl Library {
         let entry = self.get_elf()?.ehdr.e_entry;
         if entry == 0 {
             return Err(DynlinkErrorKind::NoEntryAddress {
-                name: self.name.clone(),
+                name: self.name.as_str().into(),
             }
             .into());
         }
@@ -250,7 +262,6 @@ impl Library {
     ) -> Result<RelocatedSymbol<'_>, DynlinkError> {
         let elf = self.get_elf()?;
         let common = elf.find_common_data()?;
-        tracing::trace!("lookup {} in {}", name, self.name);
 
         /*
         if self.is_relocated() {
@@ -276,11 +287,11 @@ impl Library {
                         .dynsyms
                         .as_ref()
                         .ok_or_else(|| DynlinkErrorKind::MissingSection {
-                            name: "dynsyms".to_string(),
+                            name: "dynsyms".into(),
                         })?,
                     common.dynsyms_strs.as_ref().ok_or_else(|| {
                         DynlinkErrorKind::MissingSection {
-                            name: "dynsyms_strs".to_string(),
+                            name: "dynsyms_strs".into(),
                         }
                     })?,
                 )
@@ -295,16 +306,12 @@ impl Library {
                     {
                         return Ok(RelocatedSymbol::new(sym, self));
                     } else {
-                        tracing::debug!("lookup symbol {} skipping weak binding in {}", name, self);
+                        tracing::warn!("lookup symbol {} skipping weak binding in {}", name, self);
                     }
                 } else {
-                    tracing::info!("undefined symbol: {}", name);
+                    //tracing::warn!("undefined symbol: {}", name);
                 }
             }
-            return Err(DynlinkErrorKind::NameNotFound {
-                name: name.to_string(),
-            }
-            .into());
         }
 
         // Try the sysv hash table, if present.
@@ -316,11 +323,11 @@ impl Library {
                         .dynsyms
                         .as_ref()
                         .ok_or_else(|| DynlinkErrorKind::MissingSection {
-                            name: "dynsyms".to_string(),
+                            name: "dynsyms".into(),
                         })?,
                     common.dynsyms_strs.as_ref().ok_or_else(|| {
                         DynlinkErrorKind::MissingSection {
-                            name: "dynsyms_strs".to_string(),
+                            name: "dynsyms_strs".into(),
                         }
                     })?,
                 )
@@ -335,18 +342,41 @@ impl Library {
                     {
                         return Ok(RelocatedSymbol::new(sym, self));
                     } else {
-                        tracing::info!("lookup symbol {} skipping weak binding in {}", name, self);
+                        tracing::warn!("lookup symbol {} skipping weak binding in {}", name, self);
                     }
                 } else {
-                    tracing::info!("undefined symbol: {}", name);
+                    //tracing::warn!("undefined symbol: {}", name);
                 }
             }
         }
 
-        Err(DynlinkErrorKind::NameNotFound {
-            name: name.to_string(),
+        if !self.allows_gates()
+            && !self.allows_self_gates()
+            && self.is_binary()
+            && !name.starts_with("__TWIZZLER_SECURE_GATE")
+        {
+            let dstrs = common.dynsyms_strs.as_ref().unwrap();
+            for sym in common.dynsyms.as_ref().unwrap().iter() {
+                let sym_name = dstrs.get(sym.st_name as usize)?;
+                if name == sym_name {
+                    if sym.st_bind() == STB_WEAK && allow_weak && !self.is_secgate(name) {
+                        /*
+                        tracing::warn!(
+                            "!! lookup symbol {} skipping weak binding in {}",
+                            name,
+                            self
+                        );
+                        */
+                        return Ok(RelocatedSymbol::new_zero(self));
+                    } else {
+                        //tracing::warn!("lookup symbol {} skipping weak binding in {}", name,
+                        // self);
+                    }
+                }
+            }
         }
-        .into())
+        //tracing::warn!("undefined symbol: {}", name);
+        Err(DynlinkErrorKind::NameNotFound { name: name.into() }.into())
     }
 
     pub(crate) fn lookup_symbol(
@@ -357,8 +387,10 @@ impl Library {
     ) -> Result<RelocatedSymbol<'_>, DynlinkError> {
         let ret = self.do_lookup_symbol(&name, allow_weak);
         if allow_prefix && ret.is_err() && !name.starts_with("__TWIZZLER_SECURE_GATE_") {
-            let name = format!("__TWIZZLER_SECURE_GATE_{}", name);
-            if let Ok(o) = self.do_lookup_symbol(&name, allow_weak) {
+            let mut prefixedname = SmallString::<[u8; 256]>::from_str("__TWIZZLER_SECURE_GATE_");
+            prefixedname.push_str(name);
+
+            if let Ok(o) = self.do_lookup_symbol(&prefixedname, allow_weak) {
                 return Ok(o);
             }
         }

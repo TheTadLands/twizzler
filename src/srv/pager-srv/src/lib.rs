@@ -1,36 +1,47 @@
 #![feature(naked_functions)]
 #![feature(io_error_more)]
+#![feature(test)]
+#![feature(thread_local)]
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
-use async_executor::Executor;
-use async_io::block_on;
-use disk::{Disk, DiskPageRequest};
+use async_io::Timer;
+use disk::Disk;
+use memstore::virtio::init_virtio;
 use object_store::{Ext4Store, ExternalFile, PagedObjectStore};
+use physrw::init_pr_mgr;
+use threads::{run_async, spawn_async, PagerThreadPool};
 use tracing_subscriber::fmt::format::FmtSpan;
 use twizzler::{
     collections::vec::{VecObject, VecObjectAlloc},
     object::{ObjID, Object, ObjectBuilder},
+    Result,
 };
 use twizzler_abi::pager::{
     CompletionToKernel, CompletionToPager, PagerCompletionData, RequestFromKernel, RequestFromPager,
 };
-use twizzler_queue::{QueueBase, QueueSender};
+use twizzler_queue::{QueueBase, QueueSender, SubmissionFlags};
 use twizzler_rt_abi::{error::TwzError, object::MapFlags};
 
-use crate::{data::PagerData, request_handle::handle_kernel_request};
+use crate::data::PagerData;
 
 mod data;
 mod disk;
 mod handle;
 mod helpers;
+// in-progress
+#[allow(unused)]
+mod memstore;
 mod nvme;
 mod physrw;
 mod request_handle;
+mod stats;
+mod threads;
 
 pub use handle::{pager_close_handle, pager_open_handle};
-
-pub static EXECUTOR: OnceLock<Executor> = OnceLock::new();
 
 /***
  * Tracing Init
@@ -62,7 +73,7 @@ fn data_structure_init() -> PagerData {
 fn attach_queue<T: std::marker::Copy, U: std::marker::Copy, Q>(
     obj_id: ObjID,
     queue_constructor: impl FnOnce(twizzler_queue::Queue<T, U>) -> Q,
-) -> Result<Q, String> {
+) -> Result<Q> {
     tracing::debug!("Pager Attaching Queue: {}", obj_id);
 
     let object = unsafe {
@@ -79,14 +90,10 @@ fn queue_init(
     q1: ObjID,
     q2: ObjID,
 ) -> (
-    twizzler_queue::CallbackQueueReceiver<RequestFromKernel, CompletionToKernel>,
+    twizzler_queue::Queue<RequestFromKernel, CompletionToKernel>,
     twizzler_queue::QueueSender<RequestFromPager, CompletionToPager>,
 ) {
-    let rq = attach_queue::<RequestFromKernel, CompletionToKernel, _>(
-        q1,
-        twizzler_queue::CallbackQueueReceiver::new,
-    )
-    .unwrap();
+    let rq = attach_queue::<RequestFromKernel, CompletionToKernel, _>(q1, |q| q).unwrap();
     let sq = attach_queue::<RequestFromPager, CompletionToPager, _>(
         q2,
         twizzler_queue::QueueSender::new,
@@ -97,84 +104,26 @@ fn queue_init(
 }
 
 /***
- * Async Runtime Initialization
- * Creating n threads
- */
-fn async_runtime_init(n: i32) -> &'static Executor<'static> {
-    let ex = EXECUTOR.get_or_init(|| Executor::new());
-
-    for _ in 0..n {
-        std::thread::spawn(|| block_on(ex.run(std::future::pending::<()>())));
-    }
-
-    return ex;
-}
-
-/***
  * Pager Initialization generic function which calls specific initialization functions
  */
 fn pager_init(
     q1: ObjID,
     q2: ObjID,
 ) -> (
-    twizzler_queue::CallbackQueueReceiver<RequestFromKernel, CompletionToKernel>,
+    &'static twizzler_queue::Queue<RequestFromKernel, CompletionToKernel>,
     twizzler_queue::QueueSender<RequestFromPager, CompletionToPager>,
     PagerData,
-    &'static Executor<'static>,
 ) {
     tracing_init();
     let data = data_structure_init();
-    let ex = async_runtime_init(4);
     let (rq, sq) = queue_init(q1, q2);
 
+    let rq = unsafe { Box::into_raw(Box::new(rq)).as_ref().unwrap() };
     tracing::debug!("init complete");
-    return (rq, sq, data, ex);
+    return (rq, sq, data);
 }
 
-fn spawn_queues(
-    ctx: &'static PagerContext,
-    kernel_rq: twizzler_queue::CallbackQueueReceiver<RequestFromKernel, CompletionToKernel>,
-    ex: &'static Executor<'static>,
-) {
-    tracing::debug!("spawning queues...");
-    ex.spawn(listen_queue(kernel_rq, ctx, handle_kernel_request, ex))
-        .detach();
-}
-
-async fn listen_queue<R, C, F>(
-    kernel_rq: twizzler_queue::CallbackQueueReceiver<R, C>,
-    ctx: &'static PagerContext,
-    handler: impl Fn(&'static PagerContext, R) -> F + Copy + Send + Sync + 'static,
-    _ex: &'static Executor<'static>,
-) where
-    F: std::future::Future<Output = C> + Send + 'static,
-    R: std::fmt::Debug + Copy + Send + Sync + 'static,
-    C: std::fmt::Debug + Copy + Send + Sync + 'static,
-{
-    let q = Arc::new(kernel_rq);
-    loop {
-        tracing::trace!("queue receiving...");
-        let (id, request) = q.receive().await.unwrap();
-        tracing::trace!("got request: ({},{:?})", id, request);
-
-        let comp = handler(ctx, request).await;
-        notify(&q, id, comp).await;
-    }
-}
-
-async fn notify<R, C>(q: &Arc<twizzler_queue::CallbackQueueReceiver<R, C>>, id: u32, res: C)
-where
-    R: std::fmt::Debug + Copy + Send + Sync,
-    C: std::fmt::Debug + Copy + Send + Sync + 'static,
-{
-    q.complete(id, res).await.unwrap();
-    tracing::trace!("request {} complete", id);
-}
-
-async fn report_ready(
-    ctx: &PagerContext,
-    _ex: &'static Executor<'static>,
-) -> Option<PagerCompletionData> {
+async fn report_ready(ctx: &PagerContext) -> Option<PagerCompletionData> {
     tracing::debug!("sending ready signal to kernel");
     let request = RequestFromPager::new(twizzler_abi::pager::PagerRequest::Ready);
 
@@ -193,58 +142,86 @@ async fn report_ready(
 struct PagerContext {
     data: PagerData,
     sender: Arc<QueueSender<RequestFromPager, CompletionToPager>>,
-    paged_ostore: Box<dyn PagedObjectStore<DiskPageRequest> + 'static + Sync + Send>,
-    disk: Disk,
+    kernel_notify: &'static twizzler_queue::Queue<RequestFromKernel, CompletionToKernel>,
+    _pool: PagerThreadPool,
+
+    store: OnceLock<Ext4Store<Disk>>,
 }
 
 impl PagerContext {
-    pub async fn enumerate_external(
-        &'static self,
-        id: ObjID,
-    ) -> Result<Vec<ExternalFile>, TwzError> {
-        blocking::unblock(move || {
-            Ok(self
-                .paged_ostore
-                .enumerate_external(id.raw())?
-                .iter()
-                .cloned()
-                .collect())
-        })
-        .await
+    pub fn paged_ostore(&self, _id: Option<ObjID>) -> Result<&Ext4Store<Disk>> {
+        Ok(self.store.wait())
+    }
+
+    pub async fn enumerate_external(&'static self, id: ObjID) -> Result<Vec<ExternalFile>> {
+        Ok(self
+            .paged_ostore(None)?
+            .enumerate_external(id.raw())
+            .await?
+            .iter()
+            .cloned()
+            .collect())
+    }
+
+    pub fn notify_kernel(&'static self, id: u32, comp: CompletionToKernel) {
+        self.kernel_notify
+            .complete(id, comp, SubmissionFlags::empty())
+            .unwrap();
     }
 }
 
 static PAGER_CTX: OnceLock<PagerContext> = OnceLock::new();
 
 fn do_pager_start(q1: ObjID, q2: ObjID) -> ObjID {
-    let (rq, sq, data, ex) = pager_init(q1, q2);
-    let disk = block_on(ex.run(Disk::new(ex))).unwrap();
-    let diskc = disk.clone();
-
-    let ext4_store = Ext4Store::<DiskPageRequest>::new(disk, "/").unwrap();
-
+    let (rq, sq, data) = pager_init(q1, q2);
     let sq = Arc::new(sq);
+    init_pr_mgr(sq.clone());
+    #[allow(unused_variables)]
+    let disk = run_async(Disk::new()).unwrap();
+
     let _ = PAGER_CTX.set(PagerContext {
         data,
         sender: sq,
-        paged_ostore: Box::new(ext4_store),
-        disk: diskc,
+        kernel_notify: rq,
+        store: OnceLock::new(),
+        _pool: PagerThreadPool::new(rq),
     });
     let ctx = PAGER_CTX.get().unwrap();
-    spawn_queues(ctx, rq, ex);
 
-    block_on(ex.run(async move {
-        let _ = report_ready(&ctx, ex).await.unwrap();
-    }));
+    #[allow(unused_variables)]
+    let virtio_store = run_async(init_virtio()).unwrap();
+    let ext4_store = run_async(Ext4Store::new(disk.clone(), "/")).unwrap();
+
+    let _ = ctx.store.set(ext4_store);
+
+    run_async(async move {
+        let _ = report_ready(&ctx).await.unwrap();
+    });
+
     tracing::info!("pager ready");
 
-    let bootstrap_id = ctx.paged_ostore.get_config_id().unwrap_or_else(|_| {
-        tracing::info!("creating new naming object");
-        let vo = VecObject::<u32, VecObjectAlloc>::new(ObjectBuilder::default().persist()).unwrap();
-        ctx.paged_ostore
-            .set_config_id(vo.object().id().raw())
-            .unwrap();
-        vo.object().id().raw()
+    //disk::benches::bench_disk(ctx);
+    if false {
+        spawn_async(async {
+            let pager = PAGER_CTX.get().unwrap();
+            loop {
+                pager.data.print_stats();
+                pager.data.reset_stats();
+                Timer::after(Duration::from_millis(1000)).await;
+            }
+        });
+    }
+
+    let bootstrap_id = ctx.paged_ostore(None).map_or(0u128, |po| {
+        if let Ok(id) = run_async(po.get_config_id()) {
+            id
+        } else {
+            tracing::info!("creating new naming object");
+            let vo =
+                VecObject::<u32, VecObjectAlloc>::new(ObjectBuilder::default().persist()).unwrap();
+            run_async(po.set_config_id(vo.object().id().raw())).unwrap();
+            vo.object().id().raw()
+        }
     });
     tracing::info!("found root namespace: {:x}", bootstrap_id);
 
@@ -252,23 +229,19 @@ fn do_pager_start(q1: ObjID, q2: ObjID) -> ObjID {
 }
 
 #[secgate::secure_gate]
-pub fn pager_start(q1: ObjID, q2: ObjID) -> Result<ObjID, TwzError> {
+pub fn pager_start(q1: ObjID, q2: ObjID) -> Result<ObjID> {
     Ok(do_pager_start(q1, q2))
 }
 
 #[secgate::secure_gate]
-pub fn adv_lethe() -> Result<(), TwzError> {
-    PAGER_CTX.get().unwrap().paged_ostore.flush().unwrap();
+pub fn adv_lethe() -> Result<()> {
+    run_async(PAGER_CTX.get().unwrap().paged_ostore(None)?.flush()).unwrap();
     Ok(())
 }
 
 #[secgate::secure_gate]
-pub fn disk_len(id: ObjID) -> Result<u64, TwzError> {
-    PAGER_CTX
-        .get()
-        .unwrap()
-        .paged_ostore
-        .len(id.raw())
+pub fn disk_len(id: ObjID) -> Result<u64> {
+    run_async(PAGER_CTX.get().unwrap().paged_ostore(None)?.len(id.raw()))
         // TODO: err
         .map_err(|_| TwzError::NOT_SUPPORTED)
 }

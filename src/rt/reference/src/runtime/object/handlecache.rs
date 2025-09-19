@@ -1,11 +1,17 @@
 use std::collections::BTreeMap;
 
 use tracing::trace;
-use twizzler_abi::object::MAX_SIZE;
-use twizzler_rt_abi::bindings::object_handle;
+use twizzler_abi::{
+    object::MAX_SIZE,
+    syscall::{sys_map_ctrl, MapControlCmd},
+};
+use twizzler_rt_abi::{
+    bindings::{object_handle, release_flags, RELEASE_NO_CACHE},
+    object::MapFlags,
+};
 
 use super::free_runtime_info;
-use crate::runtime::object::ObjectMapKey;
+use crate::runtime::object::{ObjectMapKey, RuntimeHandleInfo};
 
 type Mapping = super::ObjectMapKey;
 
@@ -47,6 +53,12 @@ impl HandleCache {
         if let Some(idx) = idx {
             trace!("activate {:?} from queue pos {}", map, idx);
             let (_, handle) = self.queued.remove(idx);
+            if MapFlags::from_bits_truncate(handle.map_flags).contains(MapFlags::INDIRECT) {
+                sys_map_ctrl(handle.start.cast(), MAX_SIZE, MapControlCmd::Update, 0).ok()?;
+            }
+            (unsafe { &*handle.runtime_info.cast::<RuntimeHandleInfo>() })
+                .fot_cache
+                .clear();
             self.insert(handle);
         } else {
             trace!("activate {:?}", map);
@@ -80,10 +92,14 @@ impl HandleCache {
     }
 
     /// Release a handle. Must only be called from runtime handle release (internal_refs == 0).
-    pub fn release(&mut self, handle: &object_handle) {
+    pub fn release(&mut self, handle: &object_handle, flags: release_flags) {
         let map = ObjectMapKey::from_raw_handle(handle);
         tracing::debug!("release {:?}", map);
         if let Some(handle) = self.active.remove(&map) {
+            if flags & RELEASE_NO_CACHE != 0 {
+                self.do_remove(&handle);
+                return;
+            }
             // If queue is full, evict.
             if self.queued.len() >= QUEUE_LEN {
                 let (oldmap, old) = self.queued.remove(0);

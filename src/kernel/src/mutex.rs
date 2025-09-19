@@ -23,7 +23,7 @@ use twizzler_abi::thread::ExecutionState;
 use crate::{
     arch,
     idcounter::StableId,
-    sched::{self, schedule_thread},
+    processor::sched::schedule_thread,
     spinlock::Spinlock,
     syscall::sync::finish_blocking,
     thread::{current_thread_ref, priority::Priority, Thread, ThreadRef},
@@ -90,8 +90,8 @@ impl<T> Mutex<T> {
         let mut i = 0;
         loop {
             i += 1;
-            if i > 100 {
-                logln!("mutex pause: {:?}: {}", core::panic::Location::caller(), i);
+            if i == 1000 {
+                log::debug!("mutex pause: {:?}: {}", core::panic::Location::caller(), i);
             }
             let guard = current_thread.as_ref().map(|ct| ct.enter_critical());
             let _reinsert = {
@@ -104,7 +104,7 @@ impl<T> Mutex<T> {
                         }
                     }
 
-                    queue.owner = current_thread.clone();
+                    queue.owner = current_thread.cloned();
                     break;
                 } else if let Some(ref cur_owner) = queue.owner {
                     if let Some(ref cur_thread) = current_thread {
@@ -115,7 +115,7 @@ impl<T> Mutex<T> {
                 }
 
                 let mut reinsert = true;
-                if let Some(ref thread) = current_thread {
+                if let Some(thread) = current_thread {
                     if !thread.is_idle_thread() {
                         thread.set_state(ExecutionState::Sleeping);
                         queue.queue.push_back(thread.clone());
@@ -151,7 +151,16 @@ impl<T> Mutex<T> {
         queue.owned = false;
         if let Some(thread) = queue.queue.pop_front() {
             drop(queue);
-            sched::schedule_thread(thread);
+            let mut i = 0;
+            while thread.is_critical() {
+                arch::processor::spin_wait_iteration();
+                core::hint::spin_loop();
+                i += 1;
+                if i == 1000 {
+                    log::warn!("critical thread in queue won't drop critical flag");
+                }
+            }
+            schedule_thread(thread);
         } else {
             queue.pri = None;
         }
@@ -181,6 +190,7 @@ impl<T> Drop for LockGuard<'_, T> {
     fn drop(&mut self) {
         if let Some(ref prev) = self.prev_donated_priority {
             if let Some(thread) = current_thread_ref() {
+                thread.remove_donated_priority();
                 thread.donate_priority(prev.clone());
             }
         } else if let Some(thread) = current_thread_ref() {
@@ -242,7 +252,7 @@ mod test {
 
     use super::Mutex;
     use crate::{
-        processor::NR_CPUS,
+        processor::mp::NR_CPUS,
         syscall::sync::sys_thread_sync,
         thread::{entry::run_closure_in_new_thread, priority::Priority},
         utils::quick_random,

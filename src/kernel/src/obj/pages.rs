@@ -15,9 +15,9 @@ use super::{
     Object, ObjectRef, PageNumber,
 };
 use crate::{
-    arch::memory::{frame::FRAME_SIZE, phys_to_virt},
+    arch::memory::phys_to_virt,
     memory::{
-        frame::{FrameRef, PHYS_LEVEL_LAYOUTS},
+        frame::{get_frame, FrameRef, PHYS_LEVEL_LAYOUTS},
         pagetables::{MappingFlags, MappingSettings},
         tracker::{alloc_frame, free_frame, FrameAllocFlags, FrameAllocator},
         PhysAddr, VirtAddr,
@@ -30,7 +30,7 @@ use crate::{
 /// (wired). This will likely be overhauled soon.
 #[derive(Debug)]
 enum FrameOrWired {
-    Frame(FrameRef),
+    Frame(FrameRef, usize),
     Wired(PhysAddr, usize),
 }
 
@@ -70,8 +70,12 @@ pub struct PageRef {
 impl Drop for Page {
     fn drop(&mut self) {
         match self.frame {
-            FrameOrWired::Frame(f) => {
-                free_frame(f);
+            FrameOrWired::Frame(f, count) => {
+                for i in 0..count {
+                    let pa = f.start_address().offset(i * f.size()).unwrap();
+                    let frame = get_frame(pa).unwrap();
+                    free_frame(frame);
+                }
             }
             // TODO: this could be a wired, but freeable page (see kernel quick control objects).
             FrameOrWired::Wired(_, _) => {}
@@ -80,9 +84,9 @@ impl Drop for Page {
 }
 
 impl Page {
-    pub fn new(frame: FrameRef) -> Self {
+    pub fn new(frame: FrameRef, count: usize) -> Self {
         Self {
-            frame: FrameOrWired::Frame(frame),
+            frame: FrameOrWired::Frame(frame, count),
             map_settings: MappingSettings::new(
                 Protections::all(),
                 CacheType::WriteBack,
@@ -100,7 +104,7 @@ impl Page {
 
     pub fn nr_pages(&self) -> usize {
         (match self.frame {
-            FrameOrWired::Frame(frame) => frame.size(),
+            FrameOrWired::Frame(frame, count) => frame.size() * count,
             FrameOrWired::Wired(_, s) => s,
         }) / PageNumber::PAGE_SIZE
     }
@@ -111,7 +115,7 @@ impl Page {
 
     pub fn as_slice(&self, pnum: usize) -> &[u8] {
         let len = match self.frame {
-            FrameOrWired::Frame(f) => f.size(),
+            FrameOrWired::Frame(f, count) => f.size() * count,
             FrameOrWired::Wired(_, s) => s,
         } - pnum * PageNumber::PAGE_SIZE;
         unsafe {
@@ -136,7 +140,7 @@ impl Page {
 
     pub fn as_mut_slice(&self, pnum: usize) -> &mut [u8] {
         let len = match self.frame {
-            FrameOrWired::Frame(f) => f.size(),
+            FrameOrWired::Frame(f, count) => f.size() * count,
             FrameOrWired::Wired(_, s) => s,
         } - pnum * PageNumber::PAGE_SIZE;
         unsafe {
@@ -152,15 +156,17 @@ impl Page {
 
     pub fn physical_address(&self) -> PhysAddr {
         match self.frame {
-            FrameOrWired::Frame(f) => f.start_address(),
+            FrameOrWired::Frame(f, _) => f.start_address(),
             FrameOrWired::Wired(p, _) => p,
         }
     }
 
     pub fn copy_from(&self, other: &Page, doff: usize, soff: usize, len: usize) {
         match self.frame {
-            FrameOrWired::Frame(frame) => match other.frame {
-                FrameOrWired::Frame(otherframe) => {
+            FrameOrWired::Frame(frame, count) => match other.frame {
+                FrameOrWired::Frame(otherframe, othercount) => {
+                    assert!(count <= othercount);
+                    assert_eq!(count, 1);
                     frame.copy_contents_from(otherframe, doff, soff, len)
                 }
                 FrameOrWired::Wired(phys_addr, _) => {
@@ -179,6 +185,15 @@ impl Page {
 impl PageRef {
     pub fn new(page: Arc<Page>, pn: usize, count: usize) -> Self {
         Self { page, pn, count }
+    }
+
+    pub fn adjust_down(&self, off: usize) -> Self {
+        assert!(off <= self.pn);
+        Self {
+            page: self.page.clone(),
+            pn: self.pn - off,
+            count: self.count + off,
+        }
     }
 
     pub fn adjust(&self, off: usize) -> Self {
@@ -292,24 +307,64 @@ impl Object {
         }
     }
 
+    #[track_caller]
     pub fn ensure_in_core<'a>(
         self: &'a Arc<Object>,
         mut page_tree: LockGuard<'a, PageRangeTree>,
         page_number: PageNumber,
+        used_pager: &mut bool,
     ) -> LockGuard<'a, PageRangeTree> {
         if matches!(
             page_tree.try_get_page(page_number, GetPageFlags::empty()),
             PageStatus::NoPage
         ) {
+            *used_pager = false;
             if self.use_pager() {
                 drop(page_tree);
-                crate::pager::get_object_page(self, page_number);
+                *used_pager = crate::pager::get_object_page(self, page_number);
                 page_tree = self.lock_page_tree();
             } else {
                 let flags = FrameAllocFlags::ZEROED | FrameAllocFlags::WAIT_OK;
+                let pages_per_large = PHYS_LEVEL_LAYOUTS[1].size() / PHYS_LEVEL_LAYOUTS[0].size();
+                let large_page_number = page_number.align_down(pages_per_large);
+
+                let mut entries =
+                    page_tree.range(large_page_number..(large_page_number.offset(pages_per_large)));
+                let all_empty = entries.all(|e| e.1.is_empty());
+
+                //log::info!("{} ==> {} {}", self.id(), all_empty, page_number);
+
+                if !large_page_number.is_zero()
+                    && page_number
+                        < PageNumber::from_offset(MAX_SIZE - PHYS_LEVEL_LAYOUTS[1].size())
+                    && all_empty
+                {
+                    let mut frame_allocator = FrameAllocator::new(flags, PHYS_LEVEL_LAYOUTS[1]);
+                    if let Some(frame) = frame_allocator.try_allocate() {
+                        let page = Arc::new(Page::new(frame, 1));
+                        assert_eq!(frame.size(), PHYS_LEVEL_LAYOUTS[1].size());
+                        let page = PageRef::new(page, 0, pages_per_large);
+                        let mut frame_allocator = FrameAllocator::new(flags, PHYS_LEVEL_LAYOUTS[0]);
+                        log::trace!(
+                            "{}: mapping {} for {}: {:x}",
+                            self.id(),
+                            large_page_number,
+                            page_number,
+                            page.physical_address().raw()
+                        );
+                        if page_tree
+                            .add_page(large_page_number, page, Some(&mut frame_allocator))
+                            .is_none()
+                        {
+                            log::warn!("failed to map large page {}", large_page_number);
+                        }
+                    }
+                    return page_tree;
+                }
+
                 let mut frame_allocator = FrameAllocator::new(flags, PHYS_LEVEL_LAYOUTS[0]);
                 if let Some(frame) = frame_allocator.try_allocate() {
-                    let page = Arc::new(Page::new(frame));
+                    let page = Arc::new(Page::new(frame, 1));
                     let page = PageRef::new(page, 0, 1);
                     page_tree.add_page(page_number, page, Some(&mut frame_allocator));
                 }
@@ -333,7 +388,8 @@ impl Object {
             if !can_wait {
                 return None;
             }
-            obj_page_tree = self.ensure_in_core(obj_page_tree, page_number);
+            let mut _used_pager = false;
+            obj_page_tree = self.ensure_in_core(obj_page_tree, page_number, &mut _used_pager);
             drop(obj_page_tree);
             self.read_meta(can_wait)
         }
@@ -360,7 +416,7 @@ impl Object {
             let mut frame_allocator = FrameAllocator::new(flags, PHYS_LEVEL_LAYOUTS[0]);
 
             if let Some(frame) = frame_allocator.try_allocate() {
-                let page = Arc::new(Page::new(frame));
+                let page = Arc::new(Page::new(frame, 1));
                 let page = PageRef::new(page, 0, 1);
                 unsafe {
                     let t = page.get_mut_to_val::<MetaInfo>(0);
@@ -396,31 +452,42 @@ impl Object {
         }
     }
 
-    pub fn write_base<T>(&self, info: &T) {
-        let mut offset = FRAME_SIZE;
+    pub fn write_base<T>(self: &ObjectRef, info: &T) {
+        self.write_at(info, NULLPAGE_SIZE);
+    }
+
+    pub fn write_at<T>(self: &ObjectRef, info: &T, offset: usize) {
+        let bytes = info as *const T as *const u8;
+        let len = core::mem::size_of::<T>();
+        self.write_bytes(bytes, len, offset);
+    }
+
+    pub fn write_bytes(self: &ObjectRef, bytes: *const u8, len: usize, mut offset: usize) {
         unsafe {
             let mut obj_page_tree = self.lock_page_tree();
-            let bytes = info as *const T as *const u8;
-            let len = core::mem::size_of::<T>();
             let bytes = core::slice::from_raw_parts(bytes, len);
             let mut count = 0;
             while count < len {
                 let page_number = PageNumber::from_address(VirtAddr::new(offset as u64).unwrap());
-                let thislen = core::cmp::min(0x1000, len - count);
+                let page_offset = offset % NULLPAGE_SIZE;
+                let thislen = core::cmp::min(NULLPAGE_SIZE - page_offset, len - count);
 
                 if let PageStatus::Ready(page, _) =
                     obj_page_tree.get_page(page_number, GetPageFlags::WRITE, None)
                 {
-                    let dest = &mut page.as_mut_slice()[0..thislen];
+                    let dest = &mut page.as_mut_slice()[page_offset..(page_offset + thislen)];
                     dest.copy_from_slice(&bytes[count..(count + thislen)]);
                 } else {
-                    let page = Page::new(alloc_frame(
-                        FrameAllocFlags::KERNEL
-                            | FrameAllocFlags::WAIT_OK
-                            | FrameAllocFlags::ZEROED,
-                    ));
+                    let page = Page::new(
+                        alloc_frame(
+                            FrameAllocFlags::KERNEL
+                                | FrameAllocFlags::WAIT_OK
+                                | FrameAllocFlags::ZEROED,
+                        ),
+                        1,
+                    );
                     let page = PageRef::new(Arc::new(page), 0, 1);
-                    let dest = &mut page.as_mut_slice()[0..thislen];
+                    let dest = &mut page.as_mut_slice()[page_offset..(page_offset + thislen)];
                     dest.copy_from_slice(&bytes[count..(count + thislen)]);
                     obj_page_tree.add_page(page_number, page, None);
                 }
@@ -429,7 +496,7 @@ impl Object {
                 count += thislen;
             }
             if self.use_pager() {
-                crate::pager::sync_object(self.id);
+                crate::pager::sync_object(self);
             }
         }
     }

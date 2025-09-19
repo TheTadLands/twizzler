@@ -1,13 +1,19 @@
 use alloc::{format, string::String, sync::Arc};
+use core::{ops::Range, usize};
 
 use nonoverlapping_interval_tree::NonOverlappingIntervalTree;
 
 use super::{
     pages::{Page, PageRef},
     range::PageRange,
+    PageNumber,
 };
-use crate::{memory::tracker::FrameAllocator, mutex::Mutex};
+use crate::{
+    memory::{pagetables::MappingSettings, tracker::FrameAllocator},
+    mutex::Mutex,
+};
 
+#[derive(Debug)]
 pub struct PageVec {
     tree: NonOverlappingIntervalTree<usize, PageRef>,
 }
@@ -19,6 +25,34 @@ impl PageVec {
         Self {
             tree: NonOverlappingIntervalTree::new(),
         }
+    }
+
+    pub fn first(&self) -> Option<&PageRef> {
+        self.tree
+            .range(Range {
+                start: 0,
+                end: usize::MAX,
+            })
+            .next()
+            .map(|x| x.1.value())
+    }
+
+    pub fn len(&self) -> usize {
+        self.tree.len()
+    }
+
+    pub fn estimate_memory_usage(&self) -> (usize, usize) {
+        let mut private_mem = 0;
+        let mut shared_mem = 0;
+        for r in self.tree.range(0..usize::MAX) {
+            let page_ref = r.1.value();
+            if page_ref.ref_count() > 1 {
+                shared_mem += page_ref.nr_pages() * PageNumber::PAGE_SIZE;
+            } else {
+                private_mem += page_ref.nr_pages() * PageNumber::PAGE_SIZE;
+            }
+        }
+        (private_mem, shared_mem)
     }
 
     /// Remove the first pages up to offset, and then truncate the vector to the given page count.
@@ -48,6 +82,28 @@ impl PageVec {
         str
     }
 
+    pub fn show_entry(&self, offset: usize, length: usize) -> String {
+        let mut str = String::new();
+        str += &format!("PV {:p} ", self);
+        if offset > 0 {
+            str += "[..., ";
+        } else {
+            str += "[";
+        }
+
+        let mut first = true;
+        for (k, entry) in self.tree.range(offset..(offset + length)) {
+            if !first {
+                str += ", ";
+            }
+            str += &format!("{}:{:x}", k, entry.physical_address());
+            first = false;
+        }
+        str += ", ...]";
+
+        str
+    }
+
     pub fn clone_pages_limited(
         &self,
         start: usize,
@@ -61,7 +117,7 @@ impl PageVec {
             let thisrange = (*k)..(*entry.end());
             // TODO: use larger pages
             for i in 0..entry.nr_pages() {
-                let new_page = Arc::new(Page::new(allocator.try_allocate()?));
+                let new_page = Arc::new(Page::new(allocator.try_allocate()?, 1));
                 let mut new_page = PageRef::new(new_page, 0, 1);
                 new_page.copy_from(&entry.adjust(i));
                 pv.tree.insert(thisrange.clone(), new_page);
@@ -77,9 +133,30 @@ impl PageVec {
         Some(entry.1.adjust(pn - *entry.0))
     }
 
+    pub fn pages<const MAX: usize>(
+        &self,
+        pn: usize,
+        pages: &mut heapless::Vec<(PageRef, MappingSettings), MAX>,
+        settings: MappingSettings,
+    ) {
+        let entry = self.tree.range(pn..(pn + pages.capacity()));
+
+        let mut start = pn;
+        for entry in entry {
+            if *entry.0 == start && !pages.is_full() {
+                unsafe {
+                    pages.push_unchecked((entry.1.value().clone(), settings));
+                }
+                start += entry.1.value().nr_pages();
+            } else {
+                break;
+            }
+        }
+    }
+
     pub fn add_page(&mut self, off: usize, page: PageRef) -> PageRef {
         let range = off..(off + page.nr_pages());
-        self.tree.insert_replace(range, page.clone());
+        let _k = self.tree.insert_replace(range.clone(), page.clone());
         page
     }
 }
@@ -97,7 +174,7 @@ mod tests {
 
     fn new_page() -> PageRef {
         PageRef::new(
-            Arc::new(Page::new(alloc_frame(FrameAllocFlags::empty()))),
+            Arc::new(Page::new(alloc_frame(FrameAllocFlags::empty()), 1)),
             0,
             1,
         )

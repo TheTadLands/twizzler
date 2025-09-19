@@ -1,5 +1,6 @@
 use alloc::{borrow::ToOwned, collections::BTreeMap, string::String, sync::Arc};
 
+use log::{debug, info};
 use twizzler_abi::{
     meta::{MetaExt, MetaFlags, MetaInfo, MEXT_SIZED},
     object::{ObjID, Protections, MAX_SIZE, NULLPAGE_SIZE},
@@ -51,7 +52,7 @@ pub fn init(modules: &[BootModule]) {
     for module in modules {
         let tar = tar_no_std::TarArchiveRef::new(module.as_slice())
             .expect("failed to open initrd as tar file");
-        logln!(
+        info!(
             "[kernel::initrd] loading module, {} MB...",
             module.as_slice().len() / (1024 * 1024)
         );
@@ -62,14 +63,15 @@ pub fn init(modules: &[BootModule]) {
                 continue;
             };
             let obj = obj::Object::new_kernel();
-            logln!("[kernel::initrd]  loading {:?} -> {:x}", name, obj.id());
+            debug!("[kernel::initrd]  loading {:?} -> {:x}", name, obj.id());
             let data = e.data();
             let mut total = 0;
             let mut pagenr = 1;
             while total < data.len() {
-                let page = Page::new(alloc_frame(
-                    FrameAllocFlags::KERNEL | FrameAllocFlags::ZEROED,
-                ));
+                let page = Page::new(
+                    alloc_frame(FrameAllocFlags::KERNEL | FrameAllocFlags::ZEROED),
+                    1,
+                );
                 let va: *mut u8 = page.as_virtaddr().as_mut_ptr();
                 let thislen = core::cmp::min(4096, data.len() - total);
                 unsafe {
@@ -99,9 +101,10 @@ pub fn init(modules: &[BootModule]) {
                 buffer[size_of::<MetaInfo>()..(size_of::<MetaInfo>() + size_of::<MetaExt>())]
                     .copy_from_slice(any_as_u8_slice(&me));
             }
-            let page = Page::new(alloc_frame(
-                FrameAllocFlags::KERNEL | FrameAllocFlags::ZEROED,
-            ));
+            let page = Page::new(
+                alloc_frame(FrameAllocFlags::KERNEL | FrameAllocFlags::ZEROED),
+                1,
+            );
             let va: *mut u8 = page.as_virtaddr().as_mut_ptr();
             unsafe {
                 va.copy_from(buffer.as_ptr(), 0x1000);
@@ -122,7 +125,7 @@ pub fn init(modules: &[BootModule]) {
             boot_objects.name_map.insert(name.to_owned(), obj);
             total_alloc += total;
         }
-        logln!(
+        info!(
             "[kernel::initrd]  done, loaded {} MB of object data",
             total_alloc / (1024 * 1024)
         );

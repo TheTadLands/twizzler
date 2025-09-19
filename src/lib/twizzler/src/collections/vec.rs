@@ -29,10 +29,12 @@ pub struct VecInner<T: Invariant> {
 
 impl<T: Invariant> VecInner<T> {
     fn resolve_start(&self) -> Ref<'_, T> {
+        tracing::trace!("found start as {:x}", self.start.raw());
         unsafe { self.start.resolve() }
     }
 
     fn resolve_start_tx(&self) -> Result<TxRef<T>> {
+        tracing::trace!("found start as {:x}", self.start.raw());
         let mut tx = unsafe { self.start.resolve().into_tx() }?;
         if same_object(tx.raw(), self) {
             tx.nosync();
@@ -224,7 +226,13 @@ impl<T: Invariant, Alloc: Allocator> Vec<T, Alloc> {
         } else {
             self.inner.len += 1;
             let r = self.inner.resolve_start_tx()?;
-            tracing::trace!("no grow {:p} {}", r.raw(), r.is_nosync());
+            tracing::trace!(
+                "no grow {:p} {}, {} {}",
+                r.raw(),
+                r.is_nosync(),
+                self.inner.len,
+                self.inner.cap
+            );
             Ok(Self::maybe_uninit_slice(r, self.inner.cap)
                 .get_into(oldlen)
                 .unwrap())
@@ -269,7 +277,7 @@ impl<T: Invariant, Alloc: Allocator> Vec<T, Alloc> {
 
     #[inline]
     pub unsafe fn as_mut_slice(&mut self) -> RefSliceMut<'_, T> {
-        let r = unsafe { self.inner.start.resolve().into_mut() };
+        let r = unsafe { self.inner.start.resolve_mut() };
         let slice = unsafe { RefSliceMut::from_ref(r, self.inner.len) };
         slice
     }
@@ -486,12 +494,11 @@ impl<T: Invariant, Alloc: Allocator + SingleObjectAllocator> Vec<T, Alloc> {
         self.do_push(item)
     }
 
-    fn push_ctor<F>(&mut self, ctor: F) -> Result<()>
+    pub fn push_ctor<F>(&mut self, ctor: F) -> Result<()>
     where
         F: FnOnce(RefMut<MaybeUninit<T>>) -> Result<RefMut<T>>,
     {
         let mut r = self.get_slice_grow()?;
-        tracing::info!("run push ctor");
         let _val = ctor(r.as_mut())?;
         Ok(())
     }

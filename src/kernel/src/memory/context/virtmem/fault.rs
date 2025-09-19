@@ -1,5 +1,6 @@
 use twizzler_abi::{
     object::{ObjID, Protections, MAX_SIZE},
+    syscall::MapFlags,
     upcall::{
         MemoryAccessKind, MemoryContextViolationInfo, ObjectMemoryError, ObjectMemoryFaultInfo,
         SecurityViolationInfo, UpcallInfo,
@@ -9,7 +10,13 @@ use twizzler_abi::{
 use super::{region::MapRegion, ObjectPageProvider, PageFaultFlags, Slot};
 use crate::{
     arch::VirtAddr,
-    memory::context::{kernel_context, ContextRef},
+    instant::Instant,
+    memory::{
+        context::{kernel_context, ContextRef},
+        frame::PHYS_LEVEL_LAYOUTS,
+        pagetables::{MappingCursor, PhysAddrProvider, SharedPageTable},
+        FAULT_STATS,
+    },
     obj::PageNumber,
     security::{AccessInfo, PermsInfo, KERNEL_SCTX},
     thread::{current_memory_context, current_thread_ref},
@@ -17,7 +24,11 @@ use crate::{
 
 #[allow(unused_variables)]
 fn log_fault(addr: VirtAddr, cause: MemoryAccessKind, flags: PageFaultFlags, ip: VirtAddr) {
-    // logln!("page-fault: {:?} {:?} {:?} ip={:?}", addr, cause, flags, ip);
+    FAULT_STATS
+        .total
+        .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+    //logln!("page-fault: {:?} {:?} {:?} ip={:?}", addr, cause, flags, ip);
 }
 
 fn assert_valid(addr: VirtAddr, cause: MemoryAccessKind, flags: PageFaultFlags, ip: VirtAddr) {
@@ -146,20 +157,32 @@ fn check_security(
 fn page_fault_to_region(
     addr: VirtAddr,
     cause: MemoryAccessKind,
-    _flags: PageFaultFlags,
+    flags: PageFaultFlags,
     ip: VirtAddr,
     ctx: ContextRef,
     mut sctx_id: ObjID,
     info: MapRegion,
 ) -> Result<(), UpcallInfo> {
     let id = info.object.id();
-    let page_number = PageNumber::from_address(addr);
+
+    let start_time = Instant::now();
+    let mut page_number = PageNumber::from_address(addr);
+    if info.flags.contains(MapFlags::NO_NULLPAGE) && !page_number.is_meta() {
+        log::trace!(
+            "nonull fault: {:?}: {} {}",
+            addr,
+            page_number,
+            page_number.offset(1),
+        );
+        page_number = page_number.offset(1);
+    }
 
     // Step 1: Check for address validity and check for security violations.
     check_object_addr(page_number, id, cause, addr)?;
 
     let (id_ok, default_prot) = info.object.check_id();
     if !id_ok && !info.object().is_kernel_id() {
+        /*
         logln!("ObjId: {:?}, default protections: {:?} ", id, default_prot);
         logln!(
             "id verification failed ({} {}) {:?}",
@@ -167,6 +190,7 @@ fn page_fault_to_region(
             info.object.is_kernel_id(),
             info.object.id(),
         );
+        */
     }
 
     let perms = check_security(&ctx, sctx_id, id.clone(), addr, cause, ip, default_prot)?;
@@ -177,19 +201,79 @@ fn page_fault_to_region(
         sctx_id = perms.ctx;
     }
 
-    let mapper = |mut provider: ObjectPageProvider| {
-        let cursor = info.mapping_cursor(
-            page_number.as_byte_offset(),
-            PageNumber::PAGE_SIZE * provider.count(),
-        );
+    let shared_mapper = |addr: VirtAddr, spt: &SharedPageTable| {
+        let aligned_addr = spt.align_addr(addr);
+
+        let cursor = MappingCursor::new(aligned_addr, PHYS_LEVEL_LAYOUTS[spt.level()].size());
         ctx.with_arch(sctx_id, |arch| {
-            arch.unmap(cursor);
-            arch.map(cursor, &mut provider);
+            if !arch.readmap(cursor, |mut x| {
+                x.next().map(|m| !m.is_shared()).unwrap_or_default()
+            }) {
+                if arch.readmap(cursor, |x| x.count()) > 0 {
+                    arch.unmap(cursor);
+                }
+                arch.shared_map(cursor, spt);
+            }
         });
         Ok(())
     };
 
-    info.map(addr, cause, perms, default_prot, mapper)
+    let mapper =
+        |spt: Option<&SharedPageTable>, offset: PageNumber, mut provider: ObjectPageProvider| {
+            // TODO: limit page count by mapping or by max?
+            let cursor = info.mapping_cursor(
+                offset.as_byte_offset(),
+                PageNumber::PAGE_SIZE * provider.page_count(),
+            );
+            if !ip.is_kernel() && !addr.is_kernel() {
+                if let Some(val) = provider.peek()
+                //&& info.flags.contains(MapFlags::NO_NULLPAGE)
+                {
+                    if val.len > 0x1000 {
+                        log::trace!(
+                            "!! {}: {:?}: {:?}, {} {}: {:?} {} :: {:?} {:x}",
+                            info.object().id(),
+                            addr,
+                            offset,
+                            provider.page_count(),
+                            provider.pos,
+                            val.addr,
+                            val.len / 0x1000,
+                            cursor.start(),
+                            cursor.remaining(),
+                        );
+                    }
+                }
+            }
+
+            if let Some(shared_pt) = spt {
+                shared_pt.map(cursor, &mut provider);
+            } else {
+                ctx.with_arch(sctx_id, |arch| {
+                    if provider
+                        .peek()
+                        .is_some_and(|p| p.settings.perms().contains(Protections::WRITE))
+                        && arch.readmap(cursor, |x| x.count()) > 0
+                    {
+                        arch.unmap(cursor);
+                    }
+                    arch.map(cursor, &mut provider);
+                });
+            }
+            Ok(())
+        };
+
+    info.map(
+        addr,
+        ip,
+        cause,
+        flags,
+        perms,
+        default_prot,
+        start_time,
+        mapper,
+        shared_mapper,
+    )
 }
 
 fn get_map_region(
@@ -225,7 +309,6 @@ pub fn do_page_fault(
 pub fn page_fault(addr: VirtAddr, cause: MemoryAccessKind, flags: PageFaultFlags, ip: VirtAddr) {
     let res = do_page_fault(addr, cause, flags, ip);
     if let Err(upcall) = res {
-        logln!("UpCall:{:?}", upcall);
         current_thread_ref().unwrap().send_upcall(upcall);
     }
 }

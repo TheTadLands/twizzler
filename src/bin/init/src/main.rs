@@ -142,6 +142,25 @@ fn initialize_devmgr() {
     tracing::info!("device manager ready");
     std::mem::forget(devcomp);
 }
+
+fn initialize_cache() {
+    info!("starting cache service");
+    let comp: CompartmentHandle = CompartmentLoader::new(
+        "cache",
+        "libcache_srv.so",
+        NewCompartmentFlags::EXPORT_GATES,
+    )
+    .args(&["cache-srv"])
+    .load()
+    .expect("failed to initialize cache manager");
+    let mut flags = comp.info().flags;
+    while !flags.contains(CompartmentFlags::READY) {
+        flags = comp.wait(flags);
+    }
+    tracing::info!("cache manager ready");
+    std::mem::forget(comp);
+}
+
 fn main() {
     tracing::subscriber::set_global_default(
         tracing_subscriber::fmt()
@@ -185,6 +204,8 @@ fn main() {
     tracing::info!("setting monitor nameroot: {}", root_id);
     let _ = monitor_api::set_nameroot(root_id)
         .inspect_err(|_| tracing::warn!("failed to set nameroot for monitor"));
+
+    initialize_cache();
 
     if start_unittest {
         // Load and wait for tests to complete
@@ -239,6 +260,8 @@ fn main() {
             continue;
         }
 
+        let background = cmd.iter().any(|s| *s == "&");
+
         // Find env vars
         let cmd = cmd.into_iter().map(|s| as_env(s)).collect::<Vec<_>>();
         let vars = cmd
@@ -263,9 +286,13 @@ fn main() {
             .env(vars.into_iter().map(|(k, v)| format!("{}={}", k, v)))
             .load();
         if let Ok(comp) = comp {
-            let mut flags = comp.info().flags;
-            while !flags.contains(CompartmentFlags::EXITED) {
-                flags = comp.wait(flags);
+            if background {
+                tracing::info!("continuing compartment {} in background", cmd[0]);
+            } else {
+                let mut flags = comp.info().flags;
+                while !flags.contains(CompartmentFlags::EXITED) {
+                    flags = comp.wait(flags);
+                }
             }
         } else {
             warn!("failed to start {}", cmd[0]);
@@ -306,6 +333,7 @@ fn run_tests() {
         .expect("failed to start unittest");
     let mut flags = comp.info().flags;
     while !flags.contains(CompartmentFlags::EXITED) {
+        println!("waiting for comp state change: {:?}", flags);
         flags = comp.wait(flags);
     }
 

@@ -11,7 +11,11 @@ use crate::{
         interrupt::TLB_SHOOTDOWN_VECTOR,
     },
     interrupt::{self, Destination},
-    processor::{current_processor, spin_wait_until, tls_ready, with_each_active_processor},
+    memory::pagetables::{trace_tlb_invalidation, trace_tlb_shootdown},
+    processor::{
+        mp::{current_processor, with_each_active_processor},
+        spin_wait_until, tls_ready,
+    },
     thread::current_thread_ref,
 };
 
@@ -274,6 +278,11 @@ impl ArchTlbMgr {
         this
     }
 
+    pub fn set_full_global(&mut self) {
+        self.data.set_full();
+        self.data.set_global();
+    }
+
     /// Enqueue a new TLB invalidation. is_global should be set iff the page is global, and
     /// is_terminal should be set iff the invalidation is for a leaf.
     pub fn enqueue(&mut self, addr: VirtAddr, is_global: bool, is_terminal: bool, level: usize) {
@@ -305,15 +314,17 @@ impl ArchTlbMgr {
             }
         });
         if count > 0 {
+            trace_tlb_shootdown();
             // Send the IPI, and then do local invalidations.
             super::super::super::apic::send_ipi(Destination::AllButSelf, TLB_SHOOTDOWN_VECTOR);
         }
+        trace_tlb_invalidation();
         self.data.do_invalidation();
 
         if count > 0 {
             // Ensure we don't wait too long -- TODO: this is because this TLB shootdown algorithm
             // is Not Great (tm) and should be improved (targeted shootdown, pcid tracking, ...)
-            const MAX_ITERS: usize = 3000;
+            const MAX_ITERS: usize = 5000;
             // Wait for each processor to report that it is done.
             with_each_active_processor(|p| {
                 let mut iters = 0;
@@ -328,7 +339,7 @@ impl ArchTlbMgr {
                                 );
                             }
                             if p.arch.tlb_shootdown_info.is_finished() || iters >= MAX_ITERS {
-                                if iters >= MAX_ITERS {
+                                if iters == MAX_ITERS {
                                     logln!(
                                         "warning -- TLB shootdown pause on CPUs {} -> {}",
                                         proc.id,
@@ -381,6 +392,7 @@ pub struct TlbShootdownInfo {
     // invalidates all data from both commands. In the worst case, this merge is simply a full,
     // global invalidation.
     data: UnsafeCell<[Option<TlbInvData>; NUM_TLB_SHOOTDOWN_ENTRIES]>,
+    full_invl: AtomicBool,
 }
 
 impl TlbShootdownInfo {
@@ -388,12 +400,20 @@ impl TlbShootdownInfo {
         Self {
             data: UnsafeCell::new([None, None, None, None]),
             lock: AtomicBool::new(false),
+            full_invl: AtomicBool::new(false),
         }
     }
 
     pub fn insert(&self, new_data: TlbInvData) {
         interrupt::with_disabled(|| {
+            let mut iters = 0;
             while self.lock.swap(true, Ordering::Acquire) {
+                iters += 1;
+                if iters >= 100 {
+                    log::warn!("failed to insert tlb shootdown info -- setting full_invl");
+                    self.full_invl.store(true, Ordering::SeqCst);
+                    return;
+                }
                 core::hint::spin_loop()
             }
             let data = unsafe { self.data.get().as_mut().unwrap() };
@@ -424,6 +444,10 @@ impl TlbShootdownInfo {
 
     pub fn is_finished(&self) -> bool {
         interrupt::with_disabled(|| {
+            let full_invl = self.full_invl.load(Ordering::Acquire);
+            if full_invl {
+                return false;
+            }
             // In this case, we don't actually need to grab the lock
             if self.lock.swap(true, Ordering::Acquire) {
                 return false;
@@ -437,9 +461,27 @@ impl TlbShootdownInfo {
 
     pub fn complete(&self) {
         interrupt::with_disabled(|| {
+            let mut iters = 0;
             while self.lock.swap(true, Ordering::Acquire) {
+                iters += 1;
+                if iters > 1000 {
+                    log::warn!("TLB complete pause");
+                }
                 core::hint::spin_loop();
             }
+            let full_invl = self.full_invl.swap(false, Ordering::SeqCst);
+            if full_invl {
+                let mut data = TlbInvData::new(0);
+                data.set_global();
+                data.set_full();
+                data.do_invalidation();
+
+                // Any other invalidations don't matter.
+                self.reset();
+                self.lock.store(false, Ordering::Release);
+                return;
+            }
+
             let data = unsafe { self.data.get().as_mut().unwrap() };
             for entry in data {
                 if let Some(data) = entry.take() {

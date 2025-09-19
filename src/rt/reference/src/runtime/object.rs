@@ -1,34 +1,43 @@
 use std::{
     ffi::c_void,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+use fotcache::FotCache;
 use handlecache::HandleCache;
 use tracing::warn;
 use twizzler_abi::{
     meta::{FotEntry, FotFlags},
     object::{MAX_SIZE, NULLPAGE_SIZE},
-    syscall::{sys_object_create, CreateTieFlags, CreateTieSpec, ObjectCreate},
+    syscall::{
+        sys_map_ctrl, sys_object_create, sys_object_ctrl, sys_object_read_map, CreateTieFlags,
+        CreateTieSpec, DeleteFlags, MapControlCmd, ObjectControlCmd, ObjectCreate,
+    },
 };
 use twizzler_rt_abi::{
-    bindings::object_handle,
-    error::{ArgumentError, ObjectError, ResourceError, TwzError},
-    object::{MapFlags, ObjID, ObjectHandle},
+    bindings::{object_cmd, object_handle, release_flags, RELEASE_NO_CACHE},
+    error::{ObjectError, ResourceError, TwzError},
+    object::{MapFlags, ObjID, ObjectCmd, ObjectHandle},
     Result,
 };
 
 use super::ReferenceRuntime;
 
+mod fotcache;
 mod handlecache;
 
 #[repr(C)]
 pub(crate) struct RuntimeHandleInfo {
     refs: AtomicU64,
+    fot_cache: FotCache,
+    is_deleted: AtomicBool,
 }
 
 pub(crate) fn new_runtime_info() -> *mut RuntimeHandleInfo {
     let rhi = Box::new(RuntimeHandleInfo {
         refs: AtomicU64::new(1),
+        fot_cache: FotCache::new(),
+        is_deleted: AtomicBool::new(false),
     });
     Box::into_raw(rhi)
 }
@@ -70,11 +79,41 @@ impl ReferenceRuntime {
         )
     }
 
+    pub fn update_handle(&self, handle: *mut object_handle) -> Result<()> {
+        sys_map_ctrl(
+            unsafe { &*handle }.start.cast(),
+            MAX_SIZE,
+            MapControlCmd::Update,
+            0,
+        )?;
+        unsafe { &*(&*handle).runtime_info.cast::<RuntimeHandleInfo>() }
+            .fot_cache
+            .clear();
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self), level = "trace")]
-    pub fn release_handle(&self, handle: *mut object_handle) {
-        self.object_manager.lock().release(handle);
+    pub fn release_handle(&self, handle: *mut object_handle, flags: release_flags) {
+        self.object_manager.lock().release(handle, flags);
         if self.is_monitor().is_some() {
             self.object_manager.lock().cache.flush();
+        }
+    }
+
+    pub fn object_cmd(&self, handle: *mut object_handle, cmd: object_cmd, _arg: u64) -> Result<()> {
+        let cmd: ObjectCmd = cmd.try_into()?;
+        let handle = unsafe { &*handle };
+        match cmd {
+            ObjectCmd::Delete => {
+                sys_object_ctrl(
+                    handle.id.into(),
+                    ObjectControlCmd::Delete(DeleteFlags::empty()),
+                )?;
+                unsafe { &*handle.runtime_info.cast::<RuntimeHandleInfo>() }
+                    .is_deleted
+                    .store(true, Ordering::Release);
+                Ok(())
+            }
         }
     }
 
@@ -83,11 +122,16 @@ impl ReferenceRuntime {
             return Ok(handle);
         }
 
-        let id = self
-            .get_alloc()
-            .get_id_from_ptr(ptr)
-            .ok_or(ArgumentError::InvalidAddress)?;
         let slot = ptr as usize / MAX_SIZE;
+        let Some(id) = self.get_id_from_heap_ptr(ptr) else {
+            let map = sys_object_read_map(None, slot)?;
+            return Ok(object_handle {
+                id: map.id.raw(),
+                start: (slot * MAX_SIZE) as *mut c_void,
+                map_flags: map.flags.bits(),
+                ..Default::default()
+            });
+        };
         Ok(object_handle {
             id: id.raw(),
             start: (slot * MAX_SIZE) as *mut c_void,
@@ -139,16 +183,7 @@ impl ReferenceRuntime {
         Err(ResourceError::OutOfResources.into())
     }
 
-    pub fn resolve_fot(
-        &self,
-        handle: *mut object_handle,
-        idx: u64,
-        _valid_len: usize,
-    ) -> Result<ObjectHandle> {
-        if idx == 0 || handle.is_null() {
-            return Err(TwzError::INVALID_ARGUMENT);
-        }
-        let handle = unsafe { &*handle };
+    fn read_fot_entry(&self, handle: &object_handle, idx: u64) -> Result<FotEntry> {
         let ptr = unsafe { &*handle.meta.cast::<FotEntry>().sub((idx + 1) as usize) };
         let flags = FotFlags::from_bits_truncate(ptr.flags.load(Ordering::SeqCst));
         if flags.contains(FotFlags::DELETED)
@@ -160,21 +195,57 @@ impl ReferenceRuntime {
         if flags.contains(FotFlags::RESOLVER) {
             return Err(TwzError::NOT_SUPPORTED);
         }
-        let id = ObjID::from_parts(ptr.values);
+        let val = unsafe { (ptr as *const FotEntry).read_volatile() };
 
-        let flags = FotFlags::from_bits_truncate(ptr.flags.load(Ordering::SeqCst));
+        let flags = FotFlags::from_bits_truncate(val.flags.load(Ordering::SeqCst));
         if flags.contains(FotFlags::DELETED)
             || !flags.contains(FotFlags::ACTIVE)
             || !flags.contains(FotFlags::ALLOCATED)
         {
             return Err(ObjectError::InvalidFote.into());
         }
-
-        self.map_object(id, MapFlags::READ | MapFlags::INDIRECT)
+        Ok(val)
     }
 
-    pub fn resolve_fot_local(&self, _ptr: *mut u8, _idx: u64, _valid_len: usize) -> *mut u8 {
-        //tracing::warn!("TODO: resolve local FOT entry");
+    pub fn resolve_fot(
+        &self,
+        handle: *mut object_handle,
+        idx: u64,
+        _valid_len: usize,
+        map_flags: MapFlags,
+    ) -> Result<ObjectHandle> {
+        if idx == 0 || handle.is_null() {
+            return Err(TwzError::INVALID_ARGUMENT);
+        }
+        let handle = unsafe { &*handle };
+        tracing::trace!("Resolving FOT: {:x}", handle.id);
+        let entry = self.read_fot_entry(handle, idx)?;
+        let id = ObjID::from_parts(entry.values);
+
+        let res_handle = self.map_object(id, map_flags)?;
+        unsafe { &*handle.runtime_info.cast::<RuntimeHandleInfo>() }
+            .fot_cache
+            .insert(idx, map_flags, res_handle.clone());
+        Ok(res_handle)
+    }
+
+    pub fn resolve_fot_local(
+        &self,
+        ptr: *mut u8,
+        idx: u64,
+        _valid_len: usize,
+        flags: MapFlags,
+    ) -> *mut u8 {
+        if let Some(handle) = self.object_manager.lock().get_handle(ptr) {
+            tracing::trace!("Resolving FOT local: {:x}", handle.id);
+            let rtinfo: *const RuntimeHandleInfo = handle.runtime_info.cast();
+            unsafe {
+                return (&*rtinfo)
+                    .fot_cache
+                    .resolve_cached_ptr(idx, flags)
+                    .unwrap_or(core::ptr::null_mut());
+            }
+        }
         core::ptr::null_mut()
     }
 
@@ -243,8 +314,14 @@ impl ObjectHandleManager {
     }
 
     /// Release a handle. If all handles have been released, calls to monitor to unmap.
-    pub fn release(&mut self, handle: *mut object_handle) {
+    pub fn release(&mut self, handle: *mut object_handle, mut flags: release_flags) {
         let handle = unsafe { handle.as_mut().unwrap() };
-        self.cache.release(handle);
+        if unsafe { &*handle.runtime_info.cast::<RuntimeHandleInfo>() }
+            .is_deleted
+            .load(Ordering::Acquire)
+        {
+            flags |= RELEASE_NO_CACHE;
+        }
+        self.cache.release(handle, flags);
     }
 }

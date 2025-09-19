@@ -136,7 +136,11 @@ impl AllocationRegionLevel {
         unsafe { frame.reset(addr, level, init_flags) };
         frame.set_admitted();
         frame.set_free();
-        self.non_zeroed.push_back(frame);
+        if init_flags.contains(PhysicalFrameFlags::ZEROED) {
+            self.zeroed.push_back(frame);
+        } else {
+            self.non_zeroed.push_back(frame);
+        }
         self.free += 1;
         true
     }
@@ -194,6 +198,47 @@ impl AllocationRegion {
         assert!(!frame.get_flags().contains(PhysicalFrameFlags::ALLOCATED));
         frame.set_allocated();
         Some(frame)
+    }
+
+    pub fn split_and_keep(&mut self, frame: FrameRef) -> (FrameRef, usize) {
+        if !self.contains(frame.start_address()) {
+            panic!("tried to split a frame within the wrong region");
+        }
+        let level = frame.get_level();
+        if level == 0 {
+            return (frame, PHYS_LEVEL_LAYOUTS[0].size());
+        }
+
+        let new_frame_size = PHYS_LEVEL_LAYOUTS[level - 1].size();
+        let child_count = frame.size() / new_frame_size;
+        // skip the first one for now, as that's our passed in frame.
+        for child_idx in 1..child_count {
+            let pa = frame
+                .start_address()
+                .offset(child_idx * new_frame_size)
+                .unwrap();
+            let child = unsafe { self.get_frame_mut(pa) }.unwrap();
+            unsafe {
+                child.reset(
+                    pa,
+                    (level - 1) as u8,
+                    frame.get_flags() & PhysicalFrameFlags::ZEROED,
+                )
+            };
+            child.set_admitted();
+            child.set_allocated();
+        }
+        let frame = unsafe { self.get_frame_mut(frame.start_address()) }.unwrap();
+        unsafe {
+            frame.reset(
+                frame.start_address(),
+                (level - 1) as u8,
+                frame.get_flags() & PhysicalFrameFlags::ZEROED,
+            )
+        };
+        frame.set_admitted();
+        frame.set_allocated();
+        (frame, PHYS_LEVEL_LAYOUTS[level].size())
     }
 
     fn split(&mut self, frame: FrameRef) {
@@ -278,6 +323,16 @@ impl AllocationRegion {
             // Unwrap-Ok: we know this address is in this region already
             // Safety: we are allocating a new, untouched frame here
             let frame = unsafe { indexer.get_frame_mut(cursor) }.unwrap();
+            for i in 0..PHYS_LEVEL_LAYOUTS[level].size() / PHYS_LEVEL_LAYOUTS[0].size() {
+                let sub_addr = cursor.offset(i * PHYS_LEVEL_LAYOUTS[0].size()).unwrap();
+                unsafe {
+                    indexer.get_frame_mut(sub_addr).unwrap().reset(
+                        sub_addr,
+                        0,
+                        PhysicalFrameFlags::empty(),
+                    )
+                };
+            }
             levels[level].admit_one(frame, cursor, level as u8, PhysicalFrameFlags::empty());
             cursor = cursor.offset(levels[level].alloc_size).unwrap();
         }
@@ -303,7 +358,6 @@ struct PhysicalFrameAllocator {
 pub struct Frame {
     pa: PhysAddr,
     flags: AtomicU8,
-    lock: AtomicU8,
     level: AtomicU8,
     link: LinkedListLink,
 }
@@ -317,6 +371,7 @@ impl core::fmt::Debug for Frame {
         f.debug_struct("Frame")
             .field("pa", &self.pa)
             .field("flags", &self.flags.load(Ordering::SeqCst))
+            .field("level", &self.level.load(Ordering::SeqCst))
             .finish()
     }
 }
@@ -325,7 +380,6 @@ impl Frame {
     // Safety: must only be called once, during admit_one, when the frame has not been initialized
     // yet.
     unsafe fn reset(&mut self, pa: PhysAddr, level: u8, init_flags: PhysicalFrameFlags) {
-        self.lock.store(0, Ordering::SeqCst);
         self.flags.store(init_flags.bits(), Ordering::SeqCst);
         self.level.store(level, Ordering::SeqCst);
         let pa_ptr = &mut self.pa as *mut _;
@@ -337,30 +391,21 @@ impl Frame {
         self.unlock();
     }
 
-    pub fn with_link<R>(&self, f: impl FnOnce(&mut LinkedListLink) -> R) -> R {
-        self.lock();
-        let link = unsafe {
-            (&self.link as *const _ as *mut LinkedListLink)
-                .as_mut()
-                .unwrap()
-        };
-        let r = f(link);
-        self.unlock();
-        r
-    }
-
     fn lock(&self) {
         while self
-            .lock
-            .compare_exchange_weak(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+            .flags
+            .fetch_or(PhysicalFrameFlags::LOCKED.bits(), Ordering::SeqCst)
+            & PhysicalFrameFlags::LOCKED.bits()
+            != 0
         {
+            crate::arch::processor::spin_wait_iteration();
             core::hint::spin_loop();
         }
     }
 
     fn unlock(&self) {
-        self.lock.store(0, Ordering::SeqCst);
+        self.flags
+            .fetch_and(!PhysicalFrameFlags::LOCKED.bits(), Ordering::SeqCst);
     }
 
     /// Get the start address of the frame.
@@ -507,6 +552,8 @@ bitflags::bitflags! {
         const ADMITTED = 4;
         /// (internal) The frame is owned by the kernel.
         const KERNEL = 8;
+
+        const LOCKED = (1 << 7);
     }
 }
 
@@ -566,6 +613,15 @@ impl PhysicalFrameAllocator {
                 return;
             }
         }
+    }
+
+    fn split_frame(&mut self, frame: FrameRef) -> (FrameRef, usize) {
+        for reg in &mut self.regions {
+            if reg.contains(frame.start_address()) {
+                return reg.split_and_keep(frame);
+            }
+        }
+        panic!("could not find frame region for {:?}", frame);
     }
 }
 
@@ -667,6 +723,14 @@ pub(super) fn raw_alloc_frame(flags: PhysicalFrameFlags, layout: Layout) -> Opti
 }
 
 pub(super) fn raw_free_frame(frame: FrameRef) {
+    if !frame.get_flags().contains(PhysicalFrameFlags::ADMITTED) {
+        // TODO: this happens when a sub-frame of a larger frame is freed, even though
+        // the larger frame was allocated. It'd be nice to make this not happen. But
+        // if that's impossible, we can track these freed frames in a list and periodically
+        // try to recover the large page if all associated pages are freed, and then free that.
+        log::warn!("tried to free non-admitted frame {:?}", frame);
+        return;
+    }
     assert!(frame.get_flags().contains(PhysicalFrameFlags::ADMITTED));
     assert!(frame.get_flags().contains(PhysicalFrameFlags::ALLOCATED));
     PFA.wait().lock().free(frame);
@@ -682,6 +746,10 @@ pub fn get_frame(pa: PhysAddr) -> Option<FrameRef> {
         }
     }
     None
+}
+
+pub fn split_frame(frame: FrameRef) -> (FrameRef, usize) {
+    PFA.wait().lock().split_frame(frame)
 }
 
 #[cfg(test)]

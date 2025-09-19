@@ -1,6 +1,6 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
 
-use twizzler_abi::syscall::{ClockInfo, FemtoSeconds};
+use twizzler_abi::syscall::{ClockInfo, FemtoSeconds, FEMTOS_PER_NANO};
 
 use crate::spinlock::Spinlock;
 
@@ -10,23 +10,28 @@ pub struct Ticks {
     pub rate: FemtoSeconds,
 }
 
+impl Ticks {
+    pub fn as_nanos(&self) -> u128 {
+        (self.value as u128 * self.rate.0 as u128) / FEMTOS_PER_NANO as u128
+    }
+}
+
 pub trait ClockHardware {
     fn read(&self) -> Ticks;
     fn info(&self) -> ClockInfo;
 }
 
-pub static TICK_SOURCES: Spinlock<Vec<Arc<dyn ClockHardware + Send + Sync>>> =
-    Spinlock::new(Vec::new());
+const MAX_CLOCKS: usize = 8;
+pub static TICK_SOURCES: Spinlock<[Option<Arc<dyn ClockHardware + Send + Sync>>; MAX_CLOCKS]> =
+    Spinlock::new([const { None }; MAX_CLOCKS]);
 pub const CLOCK_OFFSET: usize = 2;
 
 pub fn register_clock<T>(clock: T)
 where
     T: 'static + ClockHardware + Send + Sync,
 {
-    let mut clock_list = TICK_SOURCES.lock();
-    let clk_id = clock_list.len();
     let clk = Arc::new(clock);
-    clock_list.push(clk.clone());
+    let mut clock_list = TICK_SOURCES.lock();
     // this is a bit of a hack to reserve slots/id's 0 and 1
     // for the best monotonic and best real-time clocks
     // if not when we call sys_read_clock_info we'd have to
@@ -34,15 +39,20 @@ where
     // best real-time or monotonic clock and then
     // TICK_SOURCES to read the data. References with Arc around
     // them still point to the same memory location.
-    #[allow(unused_unsafe)]
-    if unsafe { core::intrinsics::unlikely(clk_id == 0) } {
-        // reserve space for the real-time clock
-        clock_list.push(clk.clone());
-        // offset location of this clock source
-        clock_list.push(clk.clone());
+    if clock_list[0].is_none() {
+        clock_list[0] = Some(clk.clone());
+    }
+    if clock_list[1].is_none() {
+        clock_list[1] = Some(clk.clone());
+    }
+
+    for pos in clock_list.iter_mut() {
+        if pos.is_none() {
+            *pos = Some(clk.clone());
+        }
     }
 }
 
 pub fn bench_clock() -> Option<Arc<dyn ClockHardware + Send + Sync>> {
-    TICK_SOURCES.lock().get(0).cloned()
+    TICK_SOURCES.lock().get(0).cloned().flatten()
 }

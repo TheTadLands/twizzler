@@ -5,7 +5,9 @@ use crate::{
     arch::memory::mmio::mmio_allocator,
     interrupt::{Destination, TriggerMode},
     memory::{
-        pagetables::{ContiguousProvider, Mapper, MappingCursor, MappingFlags, MappingSettings},
+        pagetables::{
+            Consistency, ContiguousProvider, Mapper, MappingCursor, MappingFlags, MappingSettings,
+        },
         PhysAddr,
     },
     once::Once,
@@ -38,7 +40,8 @@ pub fn serial() -> &'static PL011 {
         // map in with curent memory context
         unsafe {
             let mut mapper = Mapper::current();
-            mapper.map(cursor, &mut phys);
+            let consist = Consistency::new(mapper.root_address());
+            mapper.map(cursor, &mut phys, consist);
         }
 
         // create instance of the PL011 UART driver
@@ -93,7 +96,7 @@ impl PL011 {
     }
 }
 
-pub fn write(data: &[u8], _flags: crate::log::KernelConsoleWriteFlags) {
+pub fn write(data: &[u8], _flags: crate::log::KernelConsoleWriteFlags, _debug: bool) {
     // We need the memory management system up and running to use MMIO.
     // Other requests to log to the console are ignored. The console is
     // initialized lazily on first access.
@@ -111,7 +114,7 @@ pub fn write(data: &[u8], _flags: crate::log::KernelConsoleWriteFlags) {
 pub fn serial_interrupt_handler() {
     let byte = serial().rx_byte();
     if let Some(x) = byte {
-        crate::log::push_input_byte(x);
+        crate::log::push_input_byte(x, false);
     }
     serial().clear_rx_interrupt();
 }

@@ -1,4 +1,5 @@
 use elf::{endian::NativeEndian, string_table::StringTable, symbol::SymbolTable};
+use petgraph::graph::NodeIndex;
 use tracing::error;
 
 use crate::{
@@ -14,14 +15,14 @@ pub(crate) const MINIMUM_TLS_ALIGNMENT: usize = 32;
 pub use elf::abi::{
     R_X86_64_64 as REL_SYMBOLIC, R_X86_64_DTPMOD64 as REL_DTPMOD, R_X86_64_DTPOFF64 as REL_DTPOFF,
     R_X86_64_GLOB_DAT as REL_GOT, R_X86_64_JUMP_SLOT as REL_PLT, R_X86_64_RELATIVE as REL_RELATIVE,
-    R_X86_64_TPOFF64 as REL_TPOFF,
+    R_X86_64_TPOFF64 as REL_TPOFF, STB_WEAK,
 };
 
 #[repr(C)]
 pub struct Tcb<T> {
     pub self_ptr: *const Tcb<T>,
-    pub dtv: *const usize,
     pub dtv_len: usize,
+    pub dtv: *const usize,
     pub runtime_data: T,
 }
 
@@ -57,40 +58,49 @@ impl Context {
         rel: EitherRel,
         strings: &StringTable,
         syms: &SymbolTable<NativeEndian>,
+        deps_list: &[NodeIndex],
     ) -> Result<(), DynlinkError> {
         let addend = rel.addend();
         let base = lib.base_addr() as u64;
         let target: *mut u64 = lib.laddr_mut(rel.offset());
+        let mut is_weak = false;
         // Lookup a symbol if the relocation's symbol index is non-zero.
         let symbol = if rel.sym() != 0 {
             let sym = syms.get(rel.sym() as usize)?;
-            let flags = LookupFlags::empty();
+            let flags = if sym.st_bind() == STB_WEAK {
+                is_weak = true;
+                LookupFlags::ALLOW_WEAK
+            } else {
+                LookupFlags::ALLOW_WEAK
+            };
             strings
                 .get(sym.st_name as usize)
-                .map(|name| (name, self.lookup_symbol(lib.id(), name, flags)))
+                .map(|name| (name, self.lookup_symbol(lib.id(), name, flags, deps_list)))
                 .ok()
         } else {
             None
         };
-        let sn = symbol.as_ref().map(|s| s.0.to_string()).unwrap_or_default();
+        let sn = symbol.as_ref().map(|s| s.0).unwrap_or_default();
 
         // Helper for logging errors.
         let open_sym = || {
             if let Some((name, sym)) = symbol {
                 if let Ok(sym) = sym {
                     Result::<_, DynlinkError>::Ok(sym)
+                } else if is_weak {
+                    Result::<_, DynlinkError>::Ok(crate::symbol::RelocatedSymbol::new_zero(lib))
                 } else {
                     error!("{}: needed symbol {} not found", lib, name);
                     Err(DynlinkErrorKind::SymbolLookupFail {
-                        symname: name.to_string(),
-                        sourcelib: lib.name.to_string(),
+                        symname: name.into(),
+                        sourcelib: lib.name.as_str().into(),
                     }
                     .into())
                 }
             } else {
                 error!("{}: invalid relocation, no symbol data", lib);
                 Err(DynlinkErrorKind::MissingSection {
-                    name: "symbol data".to_string(),
+                    name: "symbol data".into(),
                 }
                 .into())
             }
@@ -109,7 +119,7 @@ impl Context {
                     lib.tls_id
                         .as_ref()
                         .ok_or_else(|| DynlinkErrorKind::NoTLSInfo {
-                            library: lib.name.clone(),
+                            library: lib.name.as_str().into(),
                         })?
                         .tls_id()
                 } else {
@@ -118,7 +128,7 @@ impl Context {
                         .tls_id
                         .as_ref()
                         .ok_or_else(|| DynlinkErrorKind::NoTLSInfo {
-                            library: other_lib.name.clone(),
+                            library: other_lib.name.as_str().into(),
                         })?
                         .tls_id()
                 };
@@ -143,7 +153,7 @@ impl Context {
                         lib, sn
                     );
                     Err(DynlinkErrorKind::NoTLSInfo {
-                        library: lib.name.clone(),
+                        library: lib.name.as_str().into(),
                     })?
                 }
             }
@@ -151,8 +161,8 @@ impl Context {
                 error!("{}: unsupported relocation: {}", lib, rel.r_type());
                 Result::<_, DynlinkError>::Err(
                     DynlinkErrorKind::UnsupportedReloc {
-                        library: lib.name.clone(),
-                        reloc: rel.r_type().to_string(),
+                        library: lib.name.as_str().into(),
+                        reloc: rel.r_type().to_string().into(),
                     }
                     .into(),
                 )?

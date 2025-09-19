@@ -132,7 +132,7 @@ impl Context {
         }
         match &self.library_deps[id.0] {
             LoadedOrUnloaded::Unloaded(unlib) => Err(DynlinkErrorKind::UnloadedLibrary {
-                library: unlib.name.to_string(),
+                library: unlib.name.as_str().into(),
             }
             .into()),
             LoadedOrUnloaded::Loaded(lib) => Ok(lib),
@@ -146,7 +146,7 @@ impl Context {
         }
         match &mut self.library_deps[id.0] {
             LoadedOrUnloaded::Unloaded(unlib) => Err(DynlinkErrorKind::UnloadedLibrary {
-                library: unlib.name.to_string(),
+                library: unlib.name.as_str().into(),
             }
             .into()),
             LoadedOrUnloaded::Loaded(lib) => Ok(lib),
@@ -291,5 +291,6 @@ bitflags::bitflags! {
     #[derive(Clone, Copy, Debug)]
     pub struct NewCompartmentFlags : u32 {
         const EXPORT_GATES = 0x1;
+        const DEBUG = 0x2;
     }
 }

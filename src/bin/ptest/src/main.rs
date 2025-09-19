@@ -1,4 +1,7 @@
-use std::fmt::{Debug, Display};
+use std::{
+    fmt::{Debug, Display},
+    time::Instant,
+};
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -14,6 +17,7 @@ use twizzler::{
     marker::Invariant,
     object::{MapFlags, ObjID, Object, ObjectBuilder},
 };
+use twizzler_abi::syscall::sys_object_ctrl;
 use twizzler_rt_abi::{error::TwzError, object::ObjectHandle};
 
 #[allow(dead_code)]
@@ -41,8 +45,8 @@ impl Display for Foo {
             self,
             &self.local_data,
             &self.data.as_ptr().raw(),
-        )
-        //write!(f, "{}", &*self.data.resolve())
+        )?;
+        write!(f, "{}", &*self.data.resolve())
     }
 }
 
@@ -85,6 +89,10 @@ enum SubCommand {
     Push,
     Append,
     Read,
+    Hw,
+    Rdb,
+    Preload,
+    Big,
 }
 
 fn open_or_create_arena() -> Result<ArenaObject> {
@@ -172,6 +180,8 @@ fn do_read<T: Debug + Invariant + Display>(vo: VecObject<T, VecObjectAlloc>) {
     }
 }
 
+#[link(name = "c")]
+unsafe extern "C" {}
 fn main() {
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
@@ -184,6 +194,12 @@ fn main() {
 
     let mut nh = naming::dynamic_naming_factory().unwrap();
     match cli.sub {
+        SubCommand::Hw => {
+            let top = hwlocality::topology::Topology::new().unwrap();
+            println!("{:#?}", top);
+            let cpus = top.complete_cpuset();
+            println!("==> {:?}", cpus);
+        }
         SubCommand::New => match cli.ty {
             VecTy::U32 => {
                 let _ = nh.remove("/data/ptest-obj-u32");
@@ -250,6 +266,51 @@ fn main() {
                 println!("done!: {:?}", end - start);
             }
         },
+        SubCommand::Preload => {
+            let start = std::time::Instant::now();
+            let id = nh.get("/ext/rst", GetFlags::empty()).unwrap().id;
+            sys_object_ctrl(id, twizzler_abi::syscall::ObjectControlCmd::Preload).unwrap();
+            let end = std::time::Instant::now();
+            println!("done!: {:?}", end - start);
+        }
+        SubCommand::Big => {
+            let obj = ObjectBuilder::default().persist().build(0u8).unwrap();
+            let obj = unsafe { obj.as_mut().unwrap() };
+            const LEN: usize = 1024 * 1024 * 800;
+            let mut obj = unsafe { obj.cast::<[u8; LEN]>() };
+            println!("filling...");
+            let start = Instant::now();
+            let mut base = obj.base_mut();
+            base.fill(27);
+            println!("{}ms. syncing...", start.elapsed().as_millis());
+            let start = Instant::now();
+            obj.sync().unwrap();
+            println!("=> {}ms", start.elapsed().as_millis());
+            println!("okay, rewriting and syncing");
+            let start = Instant::now();
+            let mut base = obj.base_mut();
+            base.fill(24);
+            println!("{}ms. syncing...", start.elapsed().as_millis());
+            let start = Instant::now();
+            obj.sync().unwrap();
+            println!("=> {}ms", start.elapsed().as_millis());
+        }
+        SubCommand::Rdb => {
+            println!("in progress");
+        } /*
+          SubCommand::Rdb => {
+              println!("rocksdb test");
+              let start = std::time::Instant::now();
+              let db = rocksdb::DB::open_default("db").unwrap();
+              println!("rocksdb test: put");
+              db.put("test", "value").unwrap();
+              let val = db.get("test").unwrap().unwrap();
+              let val = String::from_utf8(val).unwrap();
+              println!("rocksdb test: get: {}", val);
+              let end = std::time::Instant::now();
+              println!("done!: {:?}", end - start);
+          }
+          */
     }
 
     /*

@@ -1,5 +1,7 @@
 use alloc::sync::Arc;
 
+use twizzler_abi::pager::PagerFlags;
+
 use super::{
     pages::{Page, PageRef},
     range::{GetPageFlags, PageRange, PageRangeTree, PageStatus},
@@ -80,7 +82,7 @@ fn copy_single(
         PageStatus::Ready(page, _) => page,
         PageStatus::NoPage => dest_tree.add_page(
             dest_point,
-            PageRef::new(Arc::new(Page::new(allocator.try_allocate()?)), 0, 1),
+            PageRef::new(Arc::new(Page::new(allocator.try_allocate()?, 1)), 0, 1),
             Some(allocator),
         )?,
         _ => return None,
@@ -155,7 +157,7 @@ pub fn copy_ranges(
             (0, _) | (_, 0) => 1,
             (_, _) => 2,
         };
-    crate::pager::ensure_in_core(src, src_start, nr_pages);
+    crate::pager::ensure_in_core(src, src_start, nr_pages, PagerFlags::empty());
     // Step 1: lock the page trees for the objects, in a canonical order.
     let (mut src_tree, mut dest_tree) = crate::utils::lock_two(&src.range_tree, &dest.range_tree);
 
@@ -350,7 +352,7 @@ fn copy_bytes(
             PageStatus::Ready(page, _) => page,
             PageStatus::NoPage => dest_tree.add_page(
                 dest_point,
-                PageRef::new(Arc::new(Page::new(allocator.try_allocate()?)), 0, 1),
+                PageRef::new(Arc::new(Page::new(allocator.try_allocate()?, 1)), 0, 1),
                 Some(allocator),
             )?,
             PageStatus::AllocFail => return None,
@@ -633,7 +635,11 @@ mod test {
                 PageStatus::NoPage => tree
                     .add_page(
                         pn,
-                        PageRef::new(Arc::new(Page::new(allocator.try_allocate().unwrap())), 0, 1),
+                        PageRef::new(
+                            Arc::new(Page::new(allocator.try_allocate().unwrap(), 1)),
+                            0,
+                            1,
+                        ),
                         Some(&mut allocator),
                     )
                     .unwrap(),
