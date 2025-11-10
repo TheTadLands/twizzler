@@ -51,9 +51,9 @@ pub const CONFIG_HAVE_OWN_OFLAGS: u32 = 1;
 pub const CONFIG_MAX_TRUNCATE_SIZE: u32 = 16777216;
 pub const CONFIG_UNALIGNED_ACCESS: u32 = 0;
 pub const CONFIG_USE_USER_MALLOC: u32 = 0;
+pub const __bool_true_false_are_defined: u32 = 1;
 pub const true_: u32 = 1;
 pub const false_: u32 = 0;
-pub const __bool_true_false_are_defined: u32 = 1;
 pub const SPLAY_NEGINF: i32 = -1;
 pub const SPLAY_INF: u32 = 1;
 pub const RB_BLACK: u32 = 0;
@@ -806,6 +806,9 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = "@brief   Do cleanup works on block cache.\n @param   bc block cache descriptor."]
     pub fn ext4_bcache_cleanup(bc: *mut ext4_bcache);
+}
+unsafe extern "C" {
+    pub fn ext4_bcache_flush(bc: *mut ext4_bcache);
 }
 unsafe extern "C" {
     #[doc = "@brief   Dynamic de-initialization of block cache.\n @param   bc block cache descriptor\n @return  standard error code"]

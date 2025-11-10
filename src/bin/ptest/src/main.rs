@@ -15,7 +15,7 @@ use twizzler::{
     },
     collections::vec::{VecObject, VecObjectAlloc},
     marker::Invariant,
-    object::{MapFlags, ObjID, Object, ObjectBuilder},
+    object::{MapFlags, ObjID, Object, ObjectBuilder, RawObject},
 };
 use twizzler_abi::syscall::sys_object_ctrl;
 use twizzler_rt_abi::{error::TwzError, object::ObjectHandle};
@@ -51,7 +51,7 @@ impl Display for Foo {
 }
 
 fn create_arena() -> Result<ArenaObject> {
-    let obj = ObjectBuilder::default().persist();
+    let obj = ObjectBuilder::default().persist(true);
     ArenaObject::new(obj).into_diagnostic()
 }
 
@@ -60,7 +60,7 @@ fn open_arena(id: ObjID) -> Result<ArenaObject> {
 }
 
 fn create_vector_object<T: Debug + Invariant>() -> Result<VecObject<T, VecObjectAlloc>> {
-    let obj = ObjectBuilder::default().persist();
+    let obj = ObjectBuilder::default().persist(true);
     VecObject::<T, VecObjectAlloc>::new(obj).into_diagnostic()
 }
 
@@ -274,18 +274,48 @@ fn main() {
             println!("done!: {:?}", end - start);
         }
         SubCommand::Big => {
-            let obj = ObjectBuilder::default().persist().build(0u8).unwrap();
-            let obj = unsafe { obj.as_mut().unwrap() };
-            const LEN: usize = 1024 * 1024 * 800;
-            let mut obj = unsafe { obj.cast::<[u8; LEN]>() };
+            const LEN: usize = 1024 * 1024 * 100;
+
+            //let _ = nh.remove("/data/big");
+            if let Ok(n) = nh.get("/data/big", GetFlags::empty()) {
+                let obj = Object::<u8>::map(n.id, MapFlags::READ).unwrap();
+                let obj = unsafe { obj.cast::<[u8; LEN]>() };
+                let base = obj.base_ptr::<u8>();
+                let slice = unsafe { core::slice::from_raw_parts(base, LEN) };
+                let sum = slice.iter().fold(0u32, |acc, x| acc + *x as u32);
+                println!("SUM for {} IS: {}", obj.id(), sum);
+                let mut b = 0u16;
+                for (i, s) in slice.iter().enumerate() {
+                    b += 1;
+                    if *s != (b - 1) as u8 {
+                        println!("wrong at {}: expect: {}, got: {}", i, (b - 1) as u8, *s);
+                    }
+                }
+                return;
+            }
+
+            let obj = ObjectBuilder::default().persist(true).build(0u8).unwrap();
+            let obj = unsafe { obj.cast::<[u8; LEN]>() };
+            let mut obj = unsafe { obj.as_mut().unwrap() };
             println!("filling...");
             let start = Instant::now();
             let mut base = obj.base_mut();
-            base.fill(27);
+            let mut b = 0u16;
+            base.fill_with(|| {
+                b += 1;
+                (b - 1) as u8
+            });
+
+            let sum = base.iter().fold(0u32, |acc, x| acc + *x as u32);
+            println!("SUM WAS: {} for {}", sum, obj.id());
             println!("{}ms. syncing...", start.elapsed().as_millis());
             let start = Instant::now();
             obj.sync().unwrap();
             println!("=> {}ms", start.elapsed().as_millis());
+            let _ = nh.remove("/data/big");
+            nh.put("/data/big", obj.id()).unwrap();
+
+            /*
             println!("okay, rewriting and syncing");
             let start = Instant::now();
             let mut base = obj.base_mut();
@@ -294,6 +324,7 @@ fn main() {
             let start = Instant::now();
             obj.sync().unwrap();
             println!("=> {}ms", start.elapsed().as_millis());
+            */
         }
         SubCommand::Rdb => {
             println!("in progress");
@@ -329,7 +360,7 @@ fn main() {
     let len = vo.iter().count();
     println!("pushing items");
     let start = std::time::Instant::now();
-    let alloc = ArenaObject::new(ObjectBuilder::default().persist()).unwrap();
+    let alloc = ArenaObject::new(ObjectBuilder::default().persist(true)).unwrap();
     for i in 0..3 {
         //println!("pushing: {}", i);
         //vo.push(i).unwrap();

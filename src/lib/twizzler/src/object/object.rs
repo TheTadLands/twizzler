@@ -9,6 +9,7 @@ use twizzler_rt_abi::{
 use super::{MutObject, RawObject, TxObject, TypedObject};
 use crate::{marker::BaseType, ptr::Ref, util::maybe_remap};
 
+#[derive(Debug)]
 pub struct Object<Base> {
     handle: ObjectHandle,
     _pd: PhantomData<*const Base>,
@@ -149,6 +150,15 @@ impl<Base> Object<Base> {
     /// the object (hence why it takes &mut self).
     pub fn update(&mut self) -> Result<()> {
         twizzler_rt_abi::object::twz_rt_update_handle(&mut self.handle)
+    }
+
+    /// Sync the underlying object.
+    ///
+    /// # Safety
+    /// The caller must ensure that the object is not being concurrently modified by
+    /// another thread, and that the memory is in a valid state to represent the object.
+    pub unsafe fn sync(&mut self) -> Result<()> {
+        self.as_mut()?.sync()
     }
 }
 
